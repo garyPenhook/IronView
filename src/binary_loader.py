@@ -25,6 +25,8 @@ class SectionInfo:
 class BinaryImage:
     path: Path
     arch_size: int
+    target: str
+    file_format: str
     sections: tuple[SectionInfo, ...]
 
 
@@ -77,6 +79,30 @@ _ASection._fields_ = [
 
 _BFD_OBJECT: Final[int] = 1
 _SECTION_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_void_p, _ASectionPointer, ctypes.py_object)
+_MACH_O_MAGICS: Final[dict[bytes, str]] = {
+    b"\xFE\xED\xFA\xCE": "Mach-O 32-bit",
+    b"\xCE\xFA\xED\xFE": "Mach-O 32-bit (reversed-endian)",
+    b"\xFE\xED\xFA\xCF": "Mach-O 64-bit",
+    b"\xCF\xFA\xED\xFE": "Mach-O 64-bit (reversed-endian)",
+    b"\xCA\xFE\xBA\xBE": "Mach-O universal",
+    b"\xBE\xBA\xFE\xCA": "Mach-O universal (reversed-endian)",
+}
+
+
+def _detect_binary_format(path: Path) -> tuple[str, str]:
+    try:
+        with path.open("rb") as handle:
+            magic = handle.read(4)
+    except OSError:
+        return "Unknown", "Unavailable"
+    if magic.startswith(b"\x7FELF"):
+        return "ELF", "ELF"
+    if magic.startswith(b"MZ"):
+        return "PE/COFF", "DOS MZ / PE"
+    mach_o_detail = _MACH_O_MAGICS.get(magic)
+    if mach_o_detail is not None:
+        return "Mach-O", mach_o_detail
+    return "Unknown", magic.hex().upper() if magic else "Unavailable"
 
 
 class _LibBfd:
@@ -197,9 +223,12 @@ class BinaryLoader:
     def image(self) -> BinaryImage:
         handle = self._require_open_handle()
         libbfd = _libbfd()
+        file_format, target = _detect_binary_format(self.path)
         return BinaryImage(
             path=self.path,
             arch_size=libbfd._lib.bfd_get_arch_size(handle),
+            target=target,
+            file_format=file_format,
             sections=tuple(self.sections()),
         )
 

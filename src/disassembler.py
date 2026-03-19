@@ -7,9 +7,22 @@ from pathlib import Path
 from typing import Any
 
 import r2pipe
+from src.gnu_toolchain import SymbolInfo
 
 RADARE2_FLAGS = ["-N", "-2", "-e", "scr.color=0", "-e", "bin.relocs.apply=true"]
 DEFAULT_INSTRUCTION_LIMIT = 64
+DECOMPILATION_BACKEND_ORDER = ("pdg", "pdd", "pdc")
+DECOMPILATION_UNAVAILABLE_MARKERS = (
+    "you need to install the plugin",
+    "unknown command",
+    "invalid command",
+    "command not found",
+)
+DECOMPILATION_BACKEND_NAMES = {
+    "pdg": "r2ghidra (pdg)",
+    "pdd": "r2dec (pdd)",
+    "pdc": "radare2 pseudo (pdc)",
+}
 
 
 class Radare2DisassemblerError(RuntimeError):
@@ -68,6 +81,29 @@ class FunctionDecompilationResult:
     bits: int
     backend: str
     text: str
+    requested_backend: str | None = None
+    backend_display_name: str = ""
+    available_backends: tuple[str, ...] = ()
+    used_fallback: bool = False
+    warnings: tuple[str, ...] = ()
+    annotations: tuple["DecompilationAnnotation", ...] = ()
+    line_mappings: tuple["DecompilationLineMapping", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DecompilationAnnotation:
+    start: int
+    end: int
+    address: int
+    kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class DecompilationLineMapping:
+    line_number: int
+    start: int
+    end: int
+    addresses: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +157,32 @@ class ImportInfo:
     bind: str
     kind: str
     plt_address: int
+
+
+@dataclass(frozen=True, slots=True)
+class ExportInfo:
+    name: str
+    address: int
+    size: int
+    kind: str
+    bind: str
+
+
+@dataclass(frozen=True, slots=True)
+class RelocationInfo:
+    name: str
+    address: int
+    symbol_address: int
+    kind: str
+    is_ifunc: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BinaryMetadataReport:
+    path: Path
+    summary: str
+    text: str
+    libraries: tuple[str, ...]
 
 
 def format_disassembly(result: DisassemblyResult) -> str:
@@ -374,12 +436,216 @@ def _normalize_import(raw_import: dict[str, Any]) -> ImportInfo | None:
     )
 
 
+def _normalize_export(raw_export: dict[str, Any]) -> ExportInfo | None:
+    name = raw_export.get("realname") or raw_export.get("name")
+    address = raw_export.get("vaddr")
+    if not isinstance(name, str) or not isinstance(address, int):
+        return None
+    size = raw_export.get("size")
+    kind = raw_export.get("type")
+    bind = raw_export.get("bind")
+    return ExportInfo(
+        name=name,
+        address=address,
+        size=size if isinstance(size, int) else 0,
+        kind=kind if isinstance(kind, str) else "unknown",
+        bind=bind if isinstance(bind, str) else "",
+    )
+
+
+def _normalize_relocation(raw_relocation: dict[str, Any]) -> RelocationInfo | None:
+    name = raw_relocation.get("name")
+    if not isinstance(name, str):
+        return None
+    address = raw_relocation.get("vaddr")
+    if not isinstance(address, int):
+        address = raw_relocation.get("paddr")
+    if not isinstance(address, int):
+        return None
+    symbol_address = raw_relocation.get("sym_va")
+    kind = raw_relocation.get("type")
+    is_ifunc = raw_relocation.get("is_ifunc")
+    return RelocationInfo(
+        name=name,
+        address=address,
+        symbol_address=symbol_address if isinstance(symbol_address, int) else 0,
+        kind=kind if isinstance(kind, str) else "unknown",
+        is_ifunc=bool(is_ifunc),
+    )
+
+
+def _normalize_symbol(raw_symbol: dict[str, Any]) -> SymbolInfo | None:
+    raw_name = raw_symbol.get("realname") or raw_symbol.get("name")
+    if not isinstance(raw_name, str):
+        return None
+    address = raw_symbol.get("vaddr")
+    if not isinstance(address, int):
+        return None
+    kind = raw_symbol.get("type")
+    size = raw_symbol.get("size")
+    is_imported = raw_symbol.get("is_imported")
+    name = raw_name.removeprefix("imp.") if isinstance(is_imported, bool) and is_imported else raw_name
+    return SymbolInfo(
+        name=name,
+        demangled_name=name,
+        address=address,
+        kind=kind if isinstance(kind, str) else "unknown",
+        size=size if isinstance(size, int) else 0,
+        is_dynamic=bool(is_imported),
+    )
+
+
+def _report_value(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _is_available_decompilation_help(output: Any) -> bool:
+    text = output.strip() if isinstance(output, str) else ""
+    if not text:
+        return False
+    normalized = text.lower()
+    return not any(marker in normalized for marker in DECOMPILATION_UNAVAILABLE_MARKERS)
+
+
+def _normalize_decompilation_text(output: Any) -> str:
+    text = output.strip() if isinstance(output, str) else ""
+    if not text:
+        return ""
+    normalized = text.lower()
+    if any(marker in normalized for marker in DECOMPILATION_UNAVAILABLE_MARKERS):
+        return ""
+    return text
+
+
+def _decompilation_backend_name(backend: str) -> str:
+    return DECOMPILATION_BACKEND_NAMES.get(backend, backend)
+
+
+def _normalize_decompilation_annotation(raw_annotation: dict[str, Any]) -> DecompilationAnnotation | None:
+    start = raw_annotation.get("start")
+    end = raw_annotation.get("end")
+    address = raw_annotation.get("offset")
+    kind = raw_annotation.get("type")
+    if not isinstance(start, int) or not isinstance(end, int) or not isinstance(address, int):
+        return None
+    if start < 0 or end < start or address < 0:
+        return None
+    return DecompilationAnnotation(
+        start=start,
+        end=end,
+        address=address,
+        kind=kind if isinstance(kind, str) else "unknown",
+    )
+
+
+def _build_line_mappings(
+    text: str,
+    annotations: tuple[DecompilationAnnotation, ...],
+) -> tuple[DecompilationLineMapping, ...]:
+    if not text or not annotations:
+        return ()
+    mappings: list[DecompilationLineMapping] = []
+    offset = 0
+    for line_number, line in enumerate(text.splitlines(keepends=True), start=1):
+        line_start = offset
+        line_end = offset + len(line)
+        offset = line_end
+        addresses = tuple(
+            sorted(
+                {
+                    annotation.address
+                    for annotation in annotations
+                    if annotation.start < line_end and annotation.end + 1 > line_start
+                }
+            )
+        )
+        if not addresses:
+            continue
+        mappings.append(
+            DecompilationLineMapping(
+                line_number=line_number,
+                start=line_start,
+                end=line_end,
+                addresses=addresses,
+            )
+        )
+    if text and not text.endswith(("\n", "\r")):
+        line_start = offset
+        line_end = len(text)
+        addresses = tuple(
+            sorted(
+                {
+                    annotation.address
+                    for annotation in annotations
+                    if annotation.start < line_end and annotation.end + 1 > line_start
+                }
+            )
+        )
+        if addresses:
+            mappings.append(
+                DecompilationLineMapping(
+                    line_number=len(text.splitlines()),
+                    start=line_start,
+                    end=line_end,
+                    addresses=addresses,
+                )
+            )
+    return tuple(mappings)
+
+
+def _load_decompilation_annotations(
+    r2: r2pipe.open_sync.open,
+    backend: str,
+    address: int,
+) -> tuple[DecompilationAnnotation, ...]:
+    try:
+        raw = r2.cmdj(f"{backend}j @ {address}") or {}
+    except Exception:
+        return ()
+    if not isinstance(raw, dict):
+        return ()
+    raw_annotations = raw.get("annotations")
+    if not isinstance(raw_annotations, list):
+        return ()
+    annotations = tuple(
+        annotation
+        for item in raw_annotations
+        if isinstance(item, dict) and (annotation := _normalize_decompilation_annotation(item)) is not None
+    )
+    return tuple(sorted(annotations, key=lambda annotation: (annotation.start, annotation.end, annotation.address)))
+
+
+def _build_decompilation_warnings(
+    *,
+    backend: str,
+    requested_backend: str | None,
+    available_backends: tuple[str, ...],
+    used_fallback: bool,
+) -> tuple[str, ...]:
+    warnings: list[str] = []
+    if used_fallback:
+        preferred = requested_backend or DECOMPILATION_BACKEND_ORDER[0]
+        warnings.append(f"Preferred HLL backend {preferred} was unavailable; using {backend} instead.")
+    if backend == "pdc":
+        warnings.append("pdc output is heuristic pseudo-decompilation and may be less structured than plugin-backed output.")
+    if not available_backends:
+        warnings.append("No radare2 decompilation backends were detected.")
+    return tuple(warnings)
+
+
 class Radare2Disassembler:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).resolve()
         self._r2: r2pipe.open_sync.open | None = None
         self._architecture = "unknown"
         self._bits = 0
+        self._available_decompilation_backends: dict[str, bool] | None = None
 
     @staticmethod
     def is_available() -> bool:
@@ -420,10 +686,29 @@ class Radare2Disassembler:
             return
         r2 = self._r2
         self._r2 = None
+        self._available_decompilation_backends = None
         try:
             r2.quit()
         except Exception:
             return
+
+    def available_decompilation_backends(self) -> tuple[str, ...]:
+        r2 = self._require_open()
+        if self._available_decompilation_backends is None:
+            availability: dict[str, bool] = {}
+            for backend in DECOMPILATION_BACKEND_ORDER:
+                try:
+                    help_output = r2.cmd(f"{backend}?")
+                except Exception:
+                    availability[backend] = False
+                    continue
+                availability[backend] = _is_available_decompilation_help(help_output)
+            self._available_decompilation_backends = availability
+        return tuple(
+            backend
+            for backend in DECOMPILATION_BACKEND_ORDER
+            if self._available_decompilation_backends.get(backend)
+        )
 
     def disassemble_section(
         self,
@@ -512,6 +797,181 @@ class Radare2Disassembler:
         )
         return tuple(sorted(imports, key=lambda imp: (imp.name, imp.plt_address)))
 
+    def list_exports(self) -> tuple[ExportInfo, ...]:
+        r2 = self._require_open()
+        try:
+            raw_exports = r2.cmdj("iEj") or []
+        except Exception as exc:
+            raise Radare2DisassemblerError(f"failed to list exports: {exc}") from exc
+        if not isinstance(raw_exports, list):
+            raise Radare2DisassemblerError("radare2 returned malformed export data")
+        exports = tuple(
+            export
+            for item in raw_exports
+            if (export := _normalize_export(item)) is not None
+        )
+        return tuple(sorted(exports, key=lambda export: (export.address, export.name, export.kind)))
+
+    def list_relocations(self) -> tuple[RelocationInfo, ...]:
+        r2 = self._require_open()
+        try:
+            raw_relocations = r2.cmdj("irj") or []
+        except Exception as exc:
+            raise Radare2DisassemblerError(f"failed to list relocations: {exc}") from exc
+        if not isinstance(raw_relocations, list):
+            raise Radare2DisassemblerError("radare2 returned malformed relocation data")
+        relocations = tuple(
+            relocation
+            for item in raw_relocations
+            if (relocation := _normalize_relocation(item)) is not None
+        )
+        return tuple(sorted(relocations, key=lambda relocation: (relocation.address, relocation.name, relocation.kind)))
+
+    def list_symbols(self) -> tuple[SymbolInfo, ...]:
+        r2 = self._require_open()
+        try:
+            raw_symbols = r2.cmdj("isj") or []
+        except Exception as exc:
+            raise Radare2DisassemblerError(f"failed to list symbols: {exc}") from exc
+        if not isinstance(raw_symbols, list):
+            raise Radare2DisassemblerError("radare2 returned malformed symbol data")
+        symbols = tuple(
+            symbol
+            for item in raw_symbols
+            if (symbol := _normalize_symbol(item)) is not None
+        )
+        deduped: dict[tuple[str, int, str, bool], SymbolInfo] = {}
+        for symbol in symbols:
+            key = (symbol.name, symbol.address, symbol.kind, symbol.is_dynamic)
+            deduped[key] = symbol
+        return tuple(
+            sorted(
+                deduped.values(),
+                key=lambda symbol: (symbol.address, symbol.name, symbol.kind, symbol.is_dynamic),
+            )
+        )
+
+    def inspect_binary(self) -> BinaryMetadataReport:
+        r2 = self._require_open()
+        try:
+            info = r2.cmdj("ij") or {}
+            sections = r2.cmdj("iSj") or []
+            entrypoints = r2.cmdj("iej") or []
+            imports = r2.cmdj("iij") or []
+            libraries = r2.cmdj("ilj") or []
+        except Exception as exc:
+            raise Radare2DisassemblerError(f"failed to inspect binary metadata: {exc}") from exc
+        if not isinstance(info, dict):
+            raise Radare2DisassemblerError("radare2 returned malformed binary info data")
+        if not isinstance(sections, list):
+            sections = []
+        if not isinstance(entrypoints, list):
+            entrypoints = []
+        if not isinstance(imports, list):
+            imports = []
+        if not isinstance(libraries, list):
+            libraries = []
+
+        core_info = info.get("core")
+        bin_info = info.get("bin")
+        core = core_info if isinstance(core_info, dict) else {}
+        binary = bin_info if isinstance(bin_info, dict) else {}
+        format_name = (
+            _report_value(binary.get("bintype"))
+            or _report_value(binary.get("class"))
+            or _report_value(core.get("format"))
+            or "unknown"
+        )
+        summary_parts = [
+            format_name,
+            f"{self._architecture} {self._bits}-bit" if self._bits > 0 else self._architecture,
+            f"{len(sections):,} sections",
+            f"{len(entrypoints):,} entrypoints",
+            f"{len(libraries):,} libraries",
+            f"{len(imports):,} imports",
+        ]
+        lines = [
+            f"Path: {self.path}",
+            f"Format: {format_name}",
+        ]
+        for label, value in (
+            ("Binary Type", _report_value(core.get("type")) or _report_value(binary.get("type"))),
+            ("Architecture", _report_value(binary.get("arch")) or self._architecture),
+            ("Bits", str(self._bits) if self._bits > 0 else None),
+            ("Machine", _report_value(binary.get("machine"))),
+            ("OS", _report_value(binary.get("os"))),
+            ("Subsystem", _report_value(binary.get("subsystem"))),
+            ("Endian", _report_value(binary.get("endian"))),
+            ("Class", _report_value(binary.get("class"))),
+            ("Size", _report_value(core.get("size"))),
+            ("Human Size", _report_value(core.get("humansz"))),
+            ("PIE", _report_value(binary.get("pie"))),
+            ("PIC", _report_value(binary.get("pic"))),
+            ("NX", _report_value(binary.get("nx"))),
+            ("Canary", _report_value(binary.get("canary"))),
+            ("Stripped", _report_value(binary.get("stripped"))),
+            ("Static", _report_value(binary.get("static"))),
+            ("Compiler", _report_value(binary.get("compiler"))),
+            ("Language", _report_value(binary.get("lang"))),
+        ):
+            if value is not None:
+                lines.append(f"{label}: {value}")
+
+        lines.append("")
+        lines.append(f"Sections ({len(sections):,})")
+        for section in sections[:12]:
+            if not isinstance(section, dict):
+                continue
+            name = _report_value(section.get("name")) or "?"
+            vaddr = section.get("vaddr")
+            size = section.get("size")
+            perm = _report_value(section.get("perm")) or "----"
+            lines.append(
+                f"  {name:<16} {_format_hex(vaddr) if isinstance(vaddr, int) else '-':<12} size={size if isinstance(size, int) else 0:<8} perm={perm}"
+            )
+        if len(sections) > 12:
+            lines.append(f"  ... {len(sections) - 12} more sections")
+
+        lines.append("")
+        lines.append(f"Entrypoints ({len(entrypoints):,})")
+        for entry in entrypoints[:8]:
+            if not isinstance(entry, dict):
+                continue
+            entry_type = _report_value(entry.get("type")) or "entry"
+            vaddr = entry.get("vaddr")
+            lines.append(f"  {entry_type:<12} {_format_hex(vaddr) if isinstance(vaddr, int) else '-'}")
+        if len(entrypoints) > 8:
+            lines.append(f"  ... {len(entrypoints) - 8} more entrypoints")
+
+        lines.append("")
+        lines.append(f"Libraries ({len(libraries):,})")
+        if libraries:
+            for library in libraries[:12]:
+                lines.append(f"  {library}")
+            if len(libraries) > 12:
+                lines.append(f"  ... {len(libraries) - 12} more libraries")
+        else:
+            lines.append("  none")
+
+        lines.append("")
+        lines.append(f"Imports ({len(imports):,})")
+        for imp in imports[:16]:
+            if not isinstance(imp, dict):
+                continue
+            name = _report_value(imp.get("name")) or "?"
+            imp_type = _report_value(imp.get("type")) or "?"
+            bind = _report_value(imp.get("bind")) or "?"
+            lines.append(f"  {name:<32} {imp_type:<8} {bind}")
+        if len(imports) > 16:
+            lines.append(f"  ... {len(imports) - 16} more imports")
+
+        return BinaryMetadataReport(
+            path=self.path,
+            summary=" | ".join(summary_parts),
+            text="\n".join(lines),
+            libraries=tuple(str(library) for library in libraries if isinstance(library, str)),
+        )
+
     def list_xrefs_to_import(self, import_name: str) -> tuple[XrefInfo, ...]:
         r2 = self._require_open()
         symbol = f"sym.imp.{import_name}"
@@ -566,24 +1026,59 @@ class Radare2Disassembler:
     def decompile_function(
         self,
         function: FunctionInfo,
+        *,
+        backend: str | None = None,
     ) -> FunctionDecompilationResult:
         r2 = self._require_open()
-        try:
-            output = r2.cmd(f"pdc @ {function.address}")
-        except Exception as exc:
-            raise Radare2DisassemblerError(
-                f"failed to decompile function {function.name} at {_format_hex(function.address)}: {exc}"
-            ) from exc
-        text = output.strip() if isinstance(output, str) else ""
-        if not text:
-            raise Radare2DisassemblerError(f"radare2 returned no decompilation for {function.name}")
-        return FunctionDecompilationResult(
-            path=self.path,
-            function=function,
-            architecture=self._architecture,
-            bits=self._bits,
-            backend="pdc",
-            text=text,
+        if backend is not None and backend not in DECOMPILATION_BACKEND_ORDER:
+            raise ValueError(f"unsupported decompilation backend: {backend}")
+        available_backends = self.available_decompilation_backends()
+        if backend is not None:
+            if backend not in available_backends:
+                raise Radare2DisassemblerError(f"decompilation backend {backend} is not available")
+            candidate_backends = (backend,)
+        else:
+            candidate_backends = available_backends
+        if not candidate_backends:
+            raise Radare2DisassemblerError("no radare2 decompilation backend is available")
+
+        failures: list[str] = []
+        for candidate in candidate_backends:
+            try:
+                output = r2.cmd(f"{candidate} @ {function.address}")
+            except Exception as exc:
+                failures.append(f"{candidate}: {exc}")
+                continue
+            text = _normalize_decompilation_text(output)
+            if text:
+                used_fallback = backend is None and candidate != DECOMPILATION_BACKEND_ORDER[0]
+                annotations = _load_decompilation_annotations(r2, candidate, function.address)
+                return FunctionDecompilationResult(
+                    path=self.path,
+                    function=function,
+                    architecture=self._architecture,
+                    bits=self._bits,
+                    backend=candidate,
+                    text=text,
+                    requested_backend=backend,
+                    backend_display_name=_decompilation_backend_name(candidate),
+                    available_backends=available_backends,
+                    used_fallback=used_fallback,
+                    warnings=_build_decompilation_warnings(
+                        backend=candidate,
+                        requested_backend=backend,
+                        available_backends=available_backends,
+                        used_fallback=used_fallback,
+                    ),
+                    annotations=annotations,
+                    line_mappings=_build_line_mappings(text, annotations),
+                )
+            failures.append(f"{candidate}: no decompilation output")
+
+        attempted = ", ".join(candidate_backends)
+        details = "; ".join(failures)
+        raise Radare2DisassemblerError(
+            f"radare2 returned no decompilation for {function.name} after trying {attempted}: {details}"
         )
 
     def analyze_function_graph(

@@ -34,6 +34,7 @@ Responsibilities:
 
 - open a binary
 - validate object format
+- detect the container format from on-disk signatures
 - enumerate sections
 - read raw section bytes
 - expose immutable data objects for sections and the full image
@@ -57,9 +58,14 @@ Responsibilities:
 - enumerate functions with `aflj`
 - enumerate strings with `izj`
 - enumerate imports with `iij`
+- enumerate exports with `iEj`
+- enumerate relocations with `irj`
 - enumerate xrefs with `axtj`
 - return full function disassembly with `pdfj`
+- detect available radare2 decompilation backends and decompile through `pdg`, `pdd`, or `pdc`
+- capture backend metadata, fallback state, warnings, and line/address correlations for HLL output when available
 - return function CFGs with `agfj`
+- build a cross-format binary metadata report from `ij`, `iSj`, `iej`, `ilj`, and `iij`
 
 Primary public types:
 
@@ -89,6 +95,10 @@ Responsibilities:
 - capture ELF structure reports with `readelf`
 - expose a small typed interface to the GUI
 
+These helpers are currently treated as ELF-oriented in the GUI. For `PE/COFF`
+and `Mach-O`, the app keeps the `libbfd` and radare2 paths enabled and
+intentionally disables GNU report/source features.
+
 ### [`src/gui.py`](/home/gary/PycharmProjects/IronView/src/gui.py)
 
 Qt desktop application built with `PySide6`.
@@ -98,18 +108,26 @@ Responsibilities:
 - present sections and functions in filterable tables
 - present strings and xrefs in filterable tables
 - present imports and callers in filterable tables
-- present GNU symbols in a filterable table
+- present exports in a filterable table
+- present relocations in a filterable table
+- present radare2 symbols in a filterable table across supported formats
 - load section bytes in the background
 - load section and function disassembly in the background
 - load string xrefs in the background
 - load import callers in the background
-- load GNU symbol lists, ELF reports, and source metadata in the background
+- load export xrefs in the background
+- load relocation xrefs in the background
+- load radare2 symbol lists, radare2 binary reports, and GNU source metadata when supported
 - show section details, hex preview, and disassembly preview
 - show function metadata, demangled names, source locations, and full function disassembly
 - show string metadata and callers/xrefs
 - show import metadata and callers
+- show export metadata and matched symbol/function context
+- show export xrefs and navigate from them into functions
+- show relocation metadata and matched import/function context
+- show relocation xrefs and navigate from them into functions
 - show symbol metadata and source locations
-- show `readelf` output for the current binary
+- show a cross-format radare2 metadata report for the current binary
 - record runtime activity in a bottom system console
 - run shell commands through a `QProcess` command runner
 - launch `codex` in an external terminal session
@@ -121,21 +139,25 @@ Responsibilities:
 The current window is organized as:
 
 - Top header: title, subtitle, open button
-- Overview group: path, architecture, section count
+- Overview group: path, format, format detail, architecture, section count
 - Left vertical split:
   - Sections browser
   - Browser tabs:
     - Functions browser
     - Strings browser
     - Imports browser
+    - Exports browser
+    - Relocations browser
     - Symbols browser
 - Right inspector tabs:
   - Section
   - Function
   - String
   - Import
+  - Export
+  - Relocation
   - Symbol
-  - ELF
+  - Binary
 - Bottom console:
   - timestamped runtime and analysis log
   - shell command input and command output
@@ -154,7 +176,8 @@ Function inspector:
 - metadata form
 - GNU demangled/source fields
 - full function disassembly preview
-- HLL-style decompilation tab backed by radare2 `pdc`
+- HLL-style decompilation tab backed by the best available radare2 decompilation backend
+- backend/fallback status and correlation-aware metadata derived from decompiler output
 - CFG tab with clickable basic blocks
 - clickable target links that navigate within the current function or into another loaded function
 
@@ -170,15 +193,29 @@ Import inspector:
 - callers table
 - double-click caller navigation into the function browser
 
+Export inspector:
+
+- metadata form
+- xrefs table
+- double-click xref navigation into the function browser
+
+Relocation inspector:
+
+- metadata form
+- xrefs table
+- double-click xref navigation into the function browser
+
 Symbol inspector:
 
 - metadata form
 - demangled name
-- source location
+- source location when supported
 
-ELF inspector:
+Binary inspector:
 
-- raw `readelf -h -l -S --wide` output
+- cross-format metadata summary
+- section, entrypoint, library, and import listings from radare2
+- linked-library table
 
 ## Background Work Model
 
@@ -196,9 +233,13 @@ Current worker types:
 - `StringListWorker`
 - `XrefLoadWorker`
 - `ImportListWorker`
+- `ExportListWorker`
+- `RelocationListWorker`
 - `ImportXrefLoadWorker`
+- `ExportXrefLoadWorker`
+- `RelocationXrefLoadWorker`
 - `SymbolListWorker`
-- `ElfReportWorker`
+- `BinaryReportWorker`
 - `AddressMetadataWorker`
 
 Why this matters:
@@ -225,7 +266,7 @@ Why this matters:
 1. After image load, radare2 function enumeration starts.
 2. `aflj` results populate the function table.
 3. User selects a function.
-4. `pdfj @ <addr>`, `pdc @ <addr>`, and `agfj @ <addr>` run in the background.
+4. `pdfj @ <addr>`, the best available decompilation command from `pdg`/`pdd`/`pdc`, and `agfj @ <addr>` run in the background.
 5. The function inspector updates with metadata, formatted disassembly, an HLL-style view, and a clickable control-flow graph.
 
 ### String Flow
@@ -246,13 +287,23 @@ Why this matters:
 5. The import inspector updates with callers.
 6. Double-clicking a caller selects the matching function when one is loaded.
 
-### GNU Flow
+### Export / Relocation Flow
 
-1. After image load, GNU symbol enumeration starts through `nm`.
-2. The symbols tab populates with raw and demangled names.
-3. A `readelf` report loads into the `ELF` inspector tab.
-4. When a function or symbol is selected, `c++filt` and `addr2line` run in the background.
-5. The active inspector updates with demangled names and source-location metadata.
+1. After image load, radare2 export and relocation enumeration start.
+2. `iEj` results populate the export table, and `irj` results populate the relocation table.
+3. User selects an export or relocation.
+4. `axtj @ <addr>` runs in the background for the selected export or relocation.
+5. The matching inspector tab updates with metadata, xrefs, and correlated symbol/import/function context when available.
+6. Double-clicking an export or relocation row attempts to jump into the matching function, symbol, or import context.
+7. Double-clicking an export or relocation xref row selects the matching function when one is loaded.
+
+### Metadata Flow
+
+1. After image load, radare2 symbol enumeration starts through `isj`.
+2. The symbols tab populates with raw names and origin/type data across supported formats.
+3. A radare2 binary metadata report loads into the `Binary` inspector tab.
+4. When a function or symbol is selected, `c++filt` runs in the background, and `addr2line` joins in for ELF binaries.
+5. The active inspector updates with demangled names and source-location metadata when available.
 6. `Run GDB` launches an external debugger session for the current binary.
 
 ## Error Handling
@@ -278,16 +329,26 @@ Current test coverage in [`src/test_main.py`](/home/gary/PycharmProjects/IronVie
 - export path generation
 - radare2 section disassembly
 - radare2 function listing and function disassembly
-- radare2 function decompilation
+- radare2 function decompilation, backend fallback, and HLL metadata/correlation parsing
 - radare2 function CFG loading
 - radare2 string listing and xrefs
 - radare2 import listing and callers
-- GNU symbol listing
+- radare2 export listing
+- radare2 relocation listing
+- radare2 export xref loading
+- radare2 relocation xref loading
+- radare2 symbol listing
+- radare2 binary metadata reporting
+- linked-library population in the binary inspector
 - GNU ELF report loading
 - GUI section filter state
 - GUI function filter state
 - GUI string filter state
 - GUI import filter state
+- GUI export filter state
+- GUI export xref display and navigation
+- GUI relocation filter state
+- GUI relocation xref display and navigation
 - GUI symbol filter state
 
 ## Current Limitations

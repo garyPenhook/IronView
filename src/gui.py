@@ -52,10 +52,12 @@ from PySide6.QtWidgets import (
 
 from src.binary_loader import BinaryImage, BinaryLoader, BinaryLoaderError, SectionInfo
 from src.disassembler import (
+    BinaryMetadataReport,
     ControlFlowBlock,
     ControlFlowEdge,
     DEFAULT_INSTRUCTION_LIMIT,
     DisassemblyResult,
+    ExportInfo,
     FunctionDecompilationResult,
     FunctionDisassemblyResult,
     FunctionGraphResult,
@@ -63,12 +65,13 @@ from src.disassembler import (
     ImportInfo,
     Radare2Disassembler,
     Radare2DisassemblerError,
+    RelocationInfo,
     StringInfo,
     XrefInfo,
     format_disassembly_html,
     format_function_disassembly_html,
 )
-from src.gnu_toolchain import ElfReport, GnuToolchain, GnuToolchainError, SourceLocation, SymbolInfo
+from src.gnu_toolchain import GnuToolchain, GnuToolchainError, SourceLocation, SymbolInfo
 
 HEX_PREVIEW_LIMIT = 8192
 LIGHT_THEME = "light"
@@ -102,6 +105,20 @@ IMPORT_COLUMNS = (
     "PLT",
     "Bind",
     "Type",
+)
+EXPORT_COLUMNS = (
+    "Name",
+    "Address",
+    "Size",
+    "Type",
+    "Bind",
+)
+RELOCATION_COLUMNS = (
+    "Name",
+    "Address",
+    "Symbol",
+    "Type",
+    "IFUNC",
 )
 SYMBOL_COLUMNS = (
     "Name",
@@ -207,12 +224,42 @@ def _matches_symbol_filter(symbol: SymbolInfo, query: str) -> bool:
     normalized = query.strip().lower()
     if not normalized:
         return True
+    origin = "imported" if symbol.is_dynamic else "defined"
     haystacks = (
         symbol.name,
         symbol.demangled_name,
         _format_hex(symbol.address),
         symbol.kind,
+        origin,
         "dynamic" if symbol.is_dynamic else "regular",
+    )
+    return any(normalized in value.lower() for value in haystacks)
+
+
+def _matches_export_filter(export: ExportInfo, query: str) -> bool:
+    normalized = query.strip().lower()
+    if not normalized:
+        return True
+    haystacks = (
+        export.name,
+        _format_hex(export.address),
+        str(export.size),
+        export.kind,
+        export.bind,
+    )
+    return any(normalized in value.lower() for value in haystacks)
+
+
+def _matches_relocation_filter(relocation: RelocationInfo, query: str) -> bool:
+    normalized = query.strip().lower()
+    if not normalized:
+        return True
+    haystacks = (
+        relocation.name,
+        _format_hex(relocation.address),
+        _format_hex(relocation.symbol_address),
+        relocation.kind,
+        "ifunc" if relocation.is_ifunc else "regular",
     )
     return any(normalized in value.lower() for value in haystacks)
 
@@ -236,6 +283,34 @@ def _source_text(source_location: SourceLocation | None) -> str:
     if source_location is None:
         return "Unavailable"
     return source_location.display_text
+
+
+def _supports_gnu_elf_metadata(image: BinaryImage | None) -> bool:
+    return image is not None and image.file_format == "ELF"
+
+
+def _binary_report_message(image: BinaryImage | None) -> str:
+    if image is None:
+        return "Load a binary to inspect format metadata."
+    return f"Loading {image.file_format} metadata..."
+
+
+def _source_lookup_message(image: BinaryImage | None) -> str:
+    if image is None:
+        return "-"
+    if image.file_format == "ELF":
+        return "Loading source lookup..."
+    return f"Unavailable for {image.file_format} binaries"
+
+
+def _normalized_lookup_name(name: str) -> str:
+    normalized = name.strip().lower()
+    for prefix in ("sym.imp.", "sym.", "imp."):
+        if normalized.startswith(prefix):
+            normalized = normalized.removeprefix(prefix)
+    if "@" in normalized:
+        normalized = normalized.split("@", 1)[0]
+    return normalized.lstrip("_")
 
 
 def _cfg_block_contains_address(block: ControlFlowBlock, address: int) -> bool:
@@ -395,9 +470,35 @@ class LoadedImports:
 
 
 @dataclass(frozen=True, slots=True)
+class LoadedExports:
+    path: Path
+    exports: tuple[ExportInfo, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedRelocations:
+    path: Path
+    relocations: tuple[RelocationInfo, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class LoadedImportXrefs:
     path: Path
     import_name: str
+    xrefs: tuple[XrefInfo, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedExportXrefs:
+    path: Path
+    export_address: int
+    xrefs: tuple[XrefInfo, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedRelocationXrefs:
+    path: Path
+    relocation_address: int
     xrefs: tuple[XrefInfo, ...]
 
 
@@ -408,9 +509,9 @@ class LoadedSymbols:
 
 
 @dataclass(frozen=True, slots=True)
-class LoadedElfReport:
+class LoadedBinaryReport:
     path: Path
-    report: ElfReport | None
+    report: BinaryMetadataReport | None
     message: str = ""
 
 
@@ -441,9 +542,13 @@ class WorkerSignals(QObject):
     loaded_strings = Signal(object)
     loaded_xrefs = Signal(object)
     loaded_imports = Signal(object)
+    loaded_exports = Signal(object)
+    loaded_relocations = Signal(object)
     loaded_import_xrefs = Signal(object)
+    loaded_export_xrefs = Signal(object)
+    loaded_relocation_xrefs = Signal(object)
     loaded_symbols = Signal(object)
-    loaded_elf_report = Signal(object)
+    loaded_binary_report = Signal(object)
     loaded_address_metadata = Signal(object)
     error = Signal(object)
 
@@ -723,6 +828,41 @@ class ImportListWorker(QRunnable):
         _safe_emit(self.signals.loaded_imports, LoadedImports(path=self.path, imports=imports))
 
 
+class ExportListWorker(QRunnable):
+    def __init__(self, path: Path, signals: WorkerSignals) -> None:
+        super().__init__()
+        self.path = path
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            with Radare2Disassembler(self.path) as disassembler:
+                exports = disassembler.list_exports()
+        except Radare2DisassemblerError as exc:
+            _emit_error(self.signals, "Radare2 Error", str(exc))
+            return
+        _safe_emit(self.signals.loaded_exports, LoadedExports(path=self.path, exports=exports))
+
+
+class RelocationListWorker(QRunnable):
+    def __init__(self, path: Path, signals: WorkerSignals) -> None:
+        super().__init__()
+        self.path = path
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            with Radare2Disassembler(self.path) as disassembler:
+                relocations = disassembler.list_relocations()
+        except Radare2DisassemblerError as exc:
+            _emit_error(self.signals, "Radare2 Error", str(exc))
+            return
+        _safe_emit(
+            self.signals.loaded_relocations,
+            LoadedRelocations(path=self.path, relocations=relocations),
+        )
+
+
 class ImportXrefLoadWorker(QRunnable):
     def __init__(self, path: Path, imp: ImportInfo, signals: WorkerSignals) -> None:
         super().__init__()
@@ -743,6 +883,50 @@ class ImportXrefLoadWorker(QRunnable):
         )
 
 
+class ExportXrefLoadWorker(QRunnable):
+    def __init__(self, path: Path, export: ExportInfo, signals: WorkerSignals) -> None:
+        super().__init__()
+        self.path = path
+        self.export = export
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            with Radare2Disassembler(self.path) as disassembler:
+                xrefs = disassembler.list_xrefs_to(self.export.address)
+        except Radare2DisassemblerError as exc:
+            _emit_error(self.signals, "Radare2 Error", str(exc))
+            return
+        _safe_emit(
+            self.signals.loaded_export_xrefs,
+            LoadedExportXrefs(path=self.path, export_address=self.export.address, xrefs=xrefs),
+        )
+
+
+class RelocationXrefLoadWorker(QRunnable):
+    def __init__(self, path: Path, relocation: RelocationInfo, signals: WorkerSignals) -> None:
+        super().__init__()
+        self.path = path
+        self.relocation = relocation
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            with Radare2Disassembler(self.path) as disassembler:
+                xrefs = disassembler.list_xrefs_to(self.relocation.address)
+        except Radare2DisassemblerError as exc:
+            _emit_error(self.signals, "Radare2 Error", str(exc))
+            return
+        _safe_emit(
+            self.signals.loaded_relocation_xrefs,
+            LoadedRelocationXrefs(
+                path=self.path,
+                relocation_address=self.relocation.address,
+                xrefs=xrefs,
+            ),
+        )
+
+
 class SymbolListWorker(QRunnable):
     def __init__(self, path: Path, signals: WorkerSignals) -> None:
         super().__init__()
@@ -751,14 +935,15 @@ class SymbolListWorker(QRunnable):
 
     def run(self) -> None:
         try:
-            symbols = GnuToolchain(self.path).list_symbols()
-        except GnuToolchainError as exc:
-            _emit_error(self.signals, "GNU Toolchain Error", str(exc))
+            with Radare2Disassembler(self.path) as disassembler:
+                symbols = disassembler.list_symbols()
+        except Radare2DisassemblerError as exc:
+            _emit_error(self.signals, "Radare2 Error", str(exc))
             return
         _safe_emit(self.signals.loaded_symbols, LoadedSymbols(path=self.path, symbols=symbols))
 
 
-class ElfReportWorker(QRunnable):
+class BinaryReportWorker(QRunnable):
     def __init__(self, path: Path, signals: WorkerSignals) -> None:
         super().__init__()
         self.path = path
@@ -766,27 +951,45 @@ class ElfReportWorker(QRunnable):
 
     def run(self) -> None:
         try:
-            report = GnuToolchain(self.path).read_elf_report()
-        except GnuToolchainError as exc:
-            _safe_emit(self.signals.loaded_elf_report, LoadedElfReport(path=self.path, report=None, message=str(exc)))
+            with Radare2Disassembler(self.path) as disassembler:
+                report = disassembler.inspect_binary()
+        except Radare2DisassemblerError as exc:
+            _safe_emit(
+                self.signals.loaded_binary_report,
+                LoadedBinaryReport(path=self.path, report=None, message=str(exc)),
+            )
             return
-        _safe_emit(self.signals.loaded_elf_report, LoadedElfReport(path=self.path, report=report))
+        _safe_emit(self.signals.loaded_binary_report, LoadedBinaryReport(path=self.path, report=report))
 
 
 class AddressMetadataWorker(QRunnable):
-    def __init__(self, path: Path, raw_name: str, address: int, subject: str, signals: WorkerSignals) -> None:
+    def __init__(
+        self,
+        path: Path,
+        raw_name: str,
+        address: int,
+        subject: str,
+        signals: WorkerSignals,
+        *,
+        include_source_lookup: bool = True,
+    ) -> None:
         super().__init__()
         self.path = path
         self.raw_name = raw_name
         self.address = address
         self.subject = subject
         self.signals = signals
+        self.include_source_lookup = include_source_lookup
 
     def run(self) -> None:
         toolchain = GnuToolchain(self.path)
         try:
             demangled_name = toolchain.demangle(self.raw_name)
-            source_location = toolchain.lookup_source(self.address) if self.address > 0 else None
+            source_location = (
+                toolchain.lookup_source(self.address)
+                if self.include_source_lookup and self.address > 0
+                else None
+            )
         except GnuToolchainError as exc:
             _emit_error(self.signals, "GNU Toolchain Error", str(exc))
             return
@@ -819,9 +1022,13 @@ class MainWindow(QMainWindow):
         self._signals.loaded_strings.connect(self._on_strings_loaded)
         self._signals.loaded_xrefs.connect(self._on_xrefs_loaded)
         self._signals.loaded_imports.connect(self._on_imports_loaded)
+        self._signals.loaded_exports.connect(self._on_exports_loaded)
+        self._signals.loaded_relocations.connect(self._on_relocations_loaded)
         self._signals.loaded_import_xrefs.connect(self._on_import_xrefs_loaded)
+        self._signals.loaded_export_xrefs.connect(self._on_export_xrefs_loaded)
+        self._signals.loaded_relocation_xrefs.connect(self._on_relocation_xrefs_loaded)
         self._signals.loaded_symbols.connect(self._on_symbols_loaded)
-        self._signals.loaded_elf_report.connect(self._on_elf_report_loaded)
+        self._signals.loaded_binary_report.connect(self._on_binary_report_loaded)
         self._signals.loaded_address_metadata.connect(self._on_address_metadata_loaded)
         self._signals.error.connect(self._show_error)
         self._current_path: Path | None = None
@@ -829,8 +1036,10 @@ class MainWindow(QMainWindow):
         self._functions: tuple[FunctionInfo, ...] = ()
         self._strings: tuple[StringInfo, ...] = ()
         self._imports: tuple[ImportInfo, ...] = ()
+        self._exports: tuple[ExportInfo, ...] = ()
+        self._relocations: tuple[RelocationInfo, ...] = ()
         self._symbols: tuple[SymbolInfo, ...] = ()
-        self._readelf_report: str = ""
+        self._binary_report_text: str = ""
         self._current_section_disassembly: DisassemblyResult | None = None
         self._current_function_disassembly: FunctionDisassemblyResult | None = None
         self._current_function_decompilation: FunctionDecompilationResult | None = None
@@ -840,6 +1049,10 @@ class MainWindow(QMainWindow):
         self._selected_function_address: int | None = None
         self._selected_string_address: int | None = None
         self._selected_import_name: str | None = None
+        self._selected_export_address: int | None = None
+        self._selected_export_name: str | None = None
+        self._selected_relocation_address: int | None = None
+        self._selected_relocation_name: str | None = None
         self._selected_symbol_address: int | None = None
         self._selected_symbol_name: str | None = None
         self._selected_section_bytes = b""
@@ -973,9 +1186,13 @@ class MainWindow(QMainWindow):
         summary_layout.setContentsMargins(12, 12, 12, 12)
         self.path_value = QLabel("Not loaded")
         self.path_value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.format_value = QLabel("Not loaded")
+        self.target_value = QLabel("Not loaded")
         self.arch_value = QLabel("Not loaded")
         self.section_count_value = QLabel("0")
         summary_layout.addRow("Path", self.path_value)
+        summary_layout.addRow("Format", self.format_value)
+        summary_layout.addRow("Format Detail", self.target_value)
         summary_layout.addRow("Architecture", self.arch_value)
         summary_layout.addRow("Sections", self.section_count_value)
 
@@ -1186,6 +1403,76 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.imports_table)
         return group
 
+    def _build_exports_group(self) -> QWidget:
+        group = QGroupBox("Exports")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        filter_row = QHBoxLayout()
+        filter_label = QLabel("Filter")
+        self.export_filter_input = QLineEdit(group)
+        self.export_filter_input.setPlaceholderText("Type an export name, address, size, or type")
+        self.export_filter_input.textChanged.connect(self._apply_export_filter)
+        self.export_count_label = QLabel("0 shown")
+        self.export_count_label.setProperty("role", "muted")
+        filter_row.addWidget(filter_label)
+        filter_row.addWidget(self.export_filter_input, stretch=1)
+        filter_row.addWidget(self.export_count_label)
+
+        self.exports_table = QTableWidget(0, len(EXPORT_COLUMNS), group)
+        self.exports_table.setHorizontalHeaderLabels(EXPORT_COLUMNS)
+        self.exports_table.setAlternatingRowColors(True)
+        self.exports_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.exports_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.exports_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.exports_table.setSortingEnabled(True)
+        self.exports_table.verticalHeader().setVisible(False)
+        header = self.exports_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.exports_table.itemSelectionChanged.connect(self._on_export_selection_changed)
+        self.exports_table.itemDoubleClicked.connect(self._navigate_selected_export)
+
+        layout.addLayout(filter_row)
+        layout.addWidget(self.exports_table)
+        return group
+
+    def _build_relocations_group(self) -> QWidget:
+        group = QGroupBox("Relocations")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        filter_row = QHBoxLayout()
+        filter_label = QLabel("Filter")
+        self.relocation_filter_input = QLineEdit(group)
+        self.relocation_filter_input.setPlaceholderText("Type a relocation name, address, symbol, or type")
+        self.relocation_filter_input.textChanged.connect(self._apply_relocation_filter)
+        self.relocation_count_label = QLabel("0 shown")
+        self.relocation_count_label.setProperty("role", "muted")
+        filter_row.addWidget(filter_label)
+        filter_row.addWidget(self.relocation_filter_input, stretch=1)
+        filter_row.addWidget(self.relocation_count_label)
+
+        self.relocations_table = QTableWidget(0, len(RELOCATION_COLUMNS), group)
+        self.relocations_table.setHorizontalHeaderLabels(RELOCATION_COLUMNS)
+        self.relocations_table.setAlternatingRowColors(True)
+        self.relocations_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.relocations_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.relocations_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.relocations_table.setSortingEnabled(True)
+        self.relocations_table.verticalHeader().setVisible(False)
+        header = self.relocations_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.relocations_table.itemSelectionChanged.connect(self._on_relocation_selection_changed)
+        self.relocations_table.itemDoubleClicked.connect(self._navigate_selected_relocation)
+
+        layout.addLayout(filter_row)
+        layout.addWidget(self.relocations_table)
+        return group
+
     def _build_symbols_group(self) -> QWidget:
         group = QGroupBox("Symbols")
         layout = QVBoxLayout(group)
@@ -1223,12 +1510,14 @@ class MainWindow(QMainWindow):
         return group
 
     def _build_browser_group(self) -> QWidget:
-        tabs = QTabWidget(self)
-        tabs.addTab(self._build_functions_group(), "Functions")
-        tabs.addTab(self._build_strings_group(), "Strings")
-        tabs.addTab(self._build_imports_group(), "Imports")
-        tabs.addTab(self._build_symbols_group(), "Symbols")
-        return tabs
+        self.browser_tabs = QTabWidget(self)
+        self.browser_tabs.addTab(self._build_functions_group(), "Functions")
+        self.browser_tabs.addTab(self._build_strings_group(), "Strings")
+        self.browser_tabs.addTab(self._build_imports_group(), "Imports")
+        self.browser_tabs.addTab(self._build_exports_group(), "Exports")
+        self.browser_tabs.addTab(self._build_relocations_group(), "Relocations")
+        self.symbols_browser_index = self.browser_tabs.addTab(self._build_symbols_group(), "Symbols")
+        return self.browser_tabs
 
     def _build_details_group(self) -> QWidget:
         group = QGroupBox("Inspector")
@@ -1240,8 +1529,12 @@ class MainWindow(QMainWindow):
         self.details_tabs.addTab(self._build_function_details_tab(group), "Function")
         self.details_tabs.addTab(self._build_string_details_tab(group), "String")
         self.details_tabs.addTab(self._build_import_details_tab(group), "Import")
-        self.details_tabs.addTab(self._build_symbol_details_tab(group), "Symbol")
-        self.details_tabs.addTab(self._build_elf_details_tab(group), "ELF")
+        self.export_details_tab_index = self.details_tabs.addTab(self._build_export_details_tab(group), "Export")
+        self.relocation_details_tab_index = self.details_tabs.addTab(
+            self._build_relocation_details_tab(group), "Relocation"
+        )
+        self.symbol_details_tab_index = self.details_tabs.addTab(self._build_symbol_details_tab(group), "Symbol")
+        self.binary_details_tab_index = self.details_tabs.addTab(self._build_elf_details_tab(group), "Binary")
         layout.addWidget(self.details_tabs, stretch=1)
         return group
 
@@ -1581,22 +1874,159 @@ class MainWindow(QMainWindow):
         layout.addLayout(detail_form)
         return tab
 
+    def _build_export_details_tab(self, parent: QWidget) -> QWidget:
+        tab = QWidget(parent)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        detail_form = QFormLayout()
+        self.export_name_label = QLabel("No export selected")
+        self.export_address_label = QLabel("-")
+        self.export_size_label = QLabel("-")
+        self.export_type_label = QLabel("-")
+        self.export_bind_label = QLabel("-")
+        self.export_function_label = QLabel("-")
+        self.export_symbol_label = QLabel("-")
+        for label in (
+            self.export_name_label,
+            self.export_address_label,
+            self.export_size_label,
+            self.export_type_label,
+            self.export_bind_label,
+            self.export_function_label,
+            self.export_symbol_label,
+        ):
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        detail_form.addRow("Name", self.export_name_label)
+        detail_form.addRow("Address", self.export_address_label)
+        detail_form.addRow("Size", self.export_size_label)
+        detail_form.addRow("Type", self.export_type_label)
+        detail_form.addRow("Bind", self.export_bind_label)
+        detail_form.addRow("Matched Function", self.export_function_label)
+        detail_form.addRow("Matched Symbol", self.export_symbol_label)
+
+        xref_label = QLabel("Export Xrefs")
+        xref_font = xref_label.font()
+        xref_font.setBold(True)
+        xref_label.setFont(xref_font)
+
+        self.export_xref_summary_label = QLabel("Select an export to load xrefs.")
+        self.export_xref_summary_label.setProperty("role", "muted")
+        self.export_xrefs_table = QTableWidget(0, len(XREF_COLUMNS), parent)
+        self.export_xrefs_table.setHorizontalHeaderLabels(XREF_COLUMNS)
+        self.export_xrefs_table.setAlternatingRowColors(True)
+        self.export_xrefs_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.export_xrefs_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.export_xrefs_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.export_xrefs_table.setSortingEnabled(True)
+        self.export_xrefs_table.verticalHeader().setVisible(False)
+        header = self.export_xrefs_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.export_xrefs_table.itemDoubleClicked.connect(self._navigate_selected_export_xref)
+
+        hint = QLabel("Double-click an export in the browser to jump into symbol or function context.")
+        hint.setProperty("role", "muted")
+        layout.addLayout(detail_form)
+        layout.addWidget(hint)
+        layout.addWidget(xref_label)
+        layout.addWidget(self.export_xref_summary_label)
+        layout.addWidget(self.export_xrefs_table, stretch=1)
+        return tab
+
+    def _build_relocation_details_tab(self, parent: QWidget) -> QWidget:
+        tab = QWidget(parent)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        detail_form = QFormLayout()
+        self.relocation_name_label = QLabel("No relocation selected")
+        self.relocation_address_label = QLabel("-")
+        self.relocation_symbol_label = QLabel("-")
+        self.relocation_type_label = QLabel("-")
+        self.relocation_ifunc_label = QLabel("-")
+        self.relocation_function_label = QLabel("-")
+        self.relocation_import_label = QLabel("-")
+        for label in (
+            self.relocation_name_label,
+            self.relocation_address_label,
+            self.relocation_symbol_label,
+            self.relocation_type_label,
+            self.relocation_ifunc_label,
+            self.relocation_function_label,
+            self.relocation_import_label,
+        ):
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        detail_form.addRow("Name", self.relocation_name_label)
+        detail_form.addRow("Address", self.relocation_address_label)
+        detail_form.addRow("Symbol", self.relocation_symbol_label)
+        detail_form.addRow("Type", self.relocation_type_label)
+        detail_form.addRow("IFUNC", self.relocation_ifunc_label)
+        detail_form.addRow("Matched Function", self.relocation_function_label)
+        detail_form.addRow("Matched Import", self.relocation_import_label)
+
+        xref_label = QLabel("Relocation Xrefs")
+        xref_font = xref_label.font()
+        xref_font.setBold(True)
+        xref_label.setFont(xref_font)
+
+        self.relocation_xref_summary_label = QLabel("Select a relocation to load xrefs.")
+        self.relocation_xref_summary_label.setProperty("role", "muted")
+        self.relocation_xrefs_table = QTableWidget(0, len(XREF_COLUMNS), parent)
+        self.relocation_xrefs_table.setHorizontalHeaderLabels(XREF_COLUMNS)
+        self.relocation_xrefs_table.setAlternatingRowColors(True)
+        self.relocation_xrefs_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.relocation_xrefs_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.relocation_xrefs_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.relocation_xrefs_table.setSortingEnabled(True)
+        self.relocation_xrefs_table.verticalHeader().setVisible(False)
+        header = self.relocation_xrefs_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.relocation_xrefs_table.itemDoubleClicked.connect(self._navigate_selected_relocation_xref)
+
+        hint = QLabel("Double-click a relocation in the browser to jump toward its symbol or target address.")
+        hint.setProperty("role", "muted")
+        layout.addLayout(detail_form)
+        layout.addWidget(hint)
+        layout.addWidget(xref_label)
+        layout.addWidget(self.relocation_xref_summary_label)
+        layout.addWidget(self.relocation_xrefs_table, stretch=1)
+        return tab
+
     def _build_elf_details_tab(self, parent: QWidget) -> QWidget:
         tab = QWidget(parent)
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        self.elf_summary_label = QLabel("Loading readelf report...")
+        self.elf_summary_label = QLabel("Load a binary to inspect format metadata.")
         self.elf_summary_label.setProperty("role", "muted")
         self.elf_report_view = QPlainTextEdit(parent)
         self.elf_report_view.setReadOnly(True)
         fixed_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
         self.elf_report_view.setFont(fixed_font)
-        self.elf_report_view.setPlaceholderText("GNU readelf output will appear here.")
+        self.elf_report_view.setPlaceholderText("Binary metadata will appear here.")
+        self.library_summary_label = QLabel("Linked libraries will appear here.")
+        self.library_summary_label.setProperty("role", "muted")
+        self.libraries_table = QTableWidget(0, 1, parent)
+        self.libraries_table.setHorizontalHeaderLabels(("Library",))
+        self.libraries_table.setAlternatingRowColors(True)
+        self.libraries_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.libraries_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.libraries_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.libraries_table.setSortingEnabled(True)
+        self.libraries_table.verticalHeader().setVisible(False)
+        self.libraries_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
 
         layout.addWidget(self.elf_summary_label)
-        layout.addWidget(self.elf_report_view, stretch=1)
+        layout.addWidget(self.elf_report_view, stretch=2)
+        layout.addWidget(self.library_summary_label)
+        layout.addWidget(self.libraries_table, stretch=1)
         return tab
 
     def open_binary_dialog(self) -> None:
@@ -1620,8 +2050,10 @@ class MainWindow(QMainWindow):
         self._functions = ()
         self._strings = ()
         self._imports = ()
+        self._exports = ()
+        self._relocations = ()
         self._symbols = ()
-        self._readelf_report = ""
+        self._binary_report_text = ""
         self._current_section_disassembly = None
         self._current_function_disassembly = None
         self._current_function_decompilation = None
@@ -1631,6 +2063,10 @@ class MainWindow(QMainWindow):
         self._selected_function_address = None
         self._selected_string_address = None
         self._selected_import_name = None
+        self._selected_export_address = None
+        self._selected_export_name = None
+        self._selected_relocation_address = None
+        self._selected_relocation_name = None
         self._selected_symbol_address = None
         self._selected_symbol_name = None
         self._selected_section_bytes = b""
@@ -1638,6 +2074,8 @@ class MainWindow(QMainWindow):
         self._cfg_block_items.clear()
         self._set_loaded_state(False)
         self.path_value.setText(str(self._current_path))
+        self.format_value.setText("Detecting...")
+        self.target_value.setText("Detecting...")
         self.preview.setPlainText("")
         self.section_count_value.setText("0")
         self.arch_value.setText("Loading...")
@@ -1647,10 +2085,16 @@ class MainWindow(QMainWindow):
         self.strings_table.setRowCount(0)
         self.import_count_label.setText("0 shown")
         self.imports_table.setRowCount(0)
+        self.export_count_label.setText("0 shown")
+        self.exports_table.setRowCount(0)
+        self.relocation_count_label.setText("0 shown")
+        self.relocations_table.setRowCount(0)
         self.symbol_count_label.setText("0 shown")
         self.symbols_table.setRowCount(0)
-        self.elf_summary_label.setText("Loading readelf report...")
+        self.elf_summary_label.setText("Loading binary metadata...")
         self.elf_report_view.setPlainText("")
+        self.library_summary_label.setText("Linked libraries will appear here.")
+        self.libraries_table.setRowCount(0)
         self.disassembly_summary.setText(
             f"Previewing up to {DEFAULT_INSTRUCTION_LIMIT} instructions with radare2."
         )
@@ -1669,6 +2113,8 @@ class MainWindow(QMainWindow):
         self._current_image = loaded.image
         self._populate_sections_table(loaded.image.sections)
         self.path_value.setText(str(loaded.image.path))
+        self.format_value.setText(loaded.image.file_format)
+        self.target_value.setText(loaded.image.target)
         self.arch_value.setText(f"{loaded.image.arch_size}-bit")
         self.section_count_value.setText(_format_int(len(loaded.image.sections)))
         self._set_loaded_state(True)
@@ -1677,8 +2123,12 @@ class MainWindow(QMainWindow):
         self._thread_pool.start(FunctionListWorker(self._current_path, self._signals))
         self._thread_pool.start(StringListWorker(self._current_path, self._signals))
         self._thread_pool.start(ImportListWorker(self._current_path, self._signals))
+        self._thread_pool.start(ExportListWorker(self._current_path, self._signals))
+        self._thread_pool.start(RelocationListWorker(self._current_path, self._signals))
         self._thread_pool.start(SymbolListWorker(self._current_path, self._signals))
-        self._thread_pool.start(ElfReportWorker(self._current_path, self._signals))
+        self.elf_summary_label.setText(_binary_report_message(loaded.image))
+        self.elf_report_view.setPlainText("")
+        self._thread_pool.start(BinaryReportWorker(self._current_path, self._signals))
         self._set_status(f"Loaded {loaded.image.path}", 4000)
         self.setWindowTitle(f"{APP_NAME} - {loaded.image.path.name}")
         self._select_first_visible_row(self.sections_table)
@@ -1749,9 +2199,16 @@ class MainWindow(QMainWindow):
             return
         function = loaded.result.function
         self._current_function_decompilation = loaded.result
-        self.function_decompilation_summary.setText(
-            f"{loaded.result.backend} HLL-style decompilation for {function.name} at {_format_hex(function.address)}."
-        )
+        summary_parts = [
+            f"{loaded.result.backend_display_name or loaded.result.backend} HLL-style decompilation for {function.name} at {_format_hex(function.address)}."
+        ]
+        if loaded.result.used_fallback:
+            summary_parts.append("Fallback backend in use.")
+        if loaded.result.line_mappings:
+            summary_parts.append(f"{len(loaded.result.line_mappings):,} correlated lines.")
+        if loaded.result.warnings:
+            summary_parts.append(loaded.result.warnings[0])
+        self.function_decompilation_summary.setText(" ".join(summary_parts))
         self.function_decompilation_preview.setPlainText(loaded.result.text)
         self._set_status(f"Loaded HLL view for {function.name}", 4000)
 
@@ -1800,6 +2257,22 @@ class MainWindow(QMainWindow):
         self._apply_import_filter(self.import_filter_input.text())
         self._set_status(f"Loaded {len(loaded.imports):,} radare2 imports", 4000)
 
+    def _on_exports_loaded(self, loaded: LoadedExports) -> None:
+        if self._current_path != loaded.path:
+            return
+        self._exports = loaded.exports
+        self._populate_exports_table(loaded.exports)
+        self._apply_export_filter(self.export_filter_input.text())
+        self._set_status(f"Loaded {len(loaded.exports):,} radare2 exports", 4000)
+
+    def _on_relocations_loaded(self, loaded: LoadedRelocations) -> None:
+        if self._current_path != loaded.path:
+            return
+        self._relocations = loaded.relocations
+        self._populate_relocations_table(loaded.relocations)
+        self._apply_relocation_filter(self.relocation_filter_input.text())
+        self._set_status(f"Loaded {len(loaded.relocations):,} radare2 relocations", 4000)
+
     def _on_import_xrefs_loaded(self, loaded: LoadedImportXrefs) -> None:
         if self._current_path != loaded.path or self._selected_import_name != loaded.import_name:
             return
@@ -1807,27 +2280,47 @@ class MainWindow(QMainWindow):
         self.import_xref_summary_label.setText(f"{len(loaded.xrefs):,} callers loaded")
         self._set_status(f"Loaded {len(loaded.xrefs):,} callers for import {loaded.import_name}", 4000)
 
+    def _on_export_xrefs_loaded(self, loaded: LoadedExportXrefs) -> None:
+        if self._current_path != loaded.path or self._selected_export_address != loaded.export_address:
+            return
+        self._populate_export_xrefs_table(loaded.xrefs)
+        self.export_xref_summary_label.setText(f"{len(loaded.xrefs):,} xrefs loaded")
+        self._set_status(f"Loaded {len(loaded.xrefs):,} xrefs for export {_format_hex(loaded.export_address)}", 4000)
+
+    def _on_relocation_xrefs_loaded(self, loaded: LoadedRelocationXrefs) -> None:
+        if self._current_path != loaded.path or self._selected_relocation_address != loaded.relocation_address:
+            return
+        self._populate_relocation_xrefs_table(loaded.xrefs)
+        self.relocation_xref_summary_label.setText(f"{len(loaded.xrefs):,} xrefs loaded")
+        self._set_status(
+            f"Loaded {len(loaded.xrefs):,} xrefs for relocation {_format_hex(loaded.relocation_address)}",
+            4000,
+        )
+
     def _on_symbols_loaded(self, loaded: LoadedSymbols) -> None:
         if self._current_path != loaded.path:
             return
         self._symbols = loaded.symbols
         self._populate_symbols_table(loaded.symbols)
         self._apply_symbol_filter(self.symbol_filter_input.text())
-        self._set_status(f"Loaded {len(loaded.symbols):,} GNU symbols", 4000)
+        self._set_status(f"Loaded {len(loaded.symbols):,} radare2 symbols", 4000)
 
-    def _on_elf_report_loaded(self, loaded: LoadedElfReport) -> None:
+    def _on_binary_report_loaded(self, loaded: LoadedBinaryReport) -> None:
         if self._current_path != loaded.path:
             return
         if loaded.report is None:
-            self._readelf_report = ""
+            self._binary_report_text = ""
             self.elf_summary_label.setText(loaded.message)
             self.elf_report_view.setPlainText("")
+            self.library_summary_label.setText("Linked libraries will appear here.")
+            self.libraries_table.setRowCount(0)
             self._set_status(loaded.message, 4000)
             return
-        self._readelf_report = loaded.report.text
-        self.elf_summary_label.setText("readelf header, program header, and section report")
+        self._binary_report_text = loaded.report.text
+        self.elf_summary_label.setText(loaded.report.summary)
         self.elf_report_view.setPlainText(loaded.report.text)
-        self._set_status("Loaded GNU readelf report", 4000)
+        self._populate_libraries_table(loaded.report.libraries)
+        self._set_status("Loaded binary metadata report", 4000)
 
     def _on_address_metadata_loaded(self, loaded: LoadedAddressMetadata) -> None:
         if self._current_path != loaded.path:
@@ -1864,6 +2357,8 @@ class MainWindow(QMainWindow):
         self.functions_table.setEnabled(loaded)
         self.strings_table.setEnabled(loaded)
         self.imports_table.setEnabled(loaded)
+        self.exports_table.setEnabled(loaded)
+        self.relocations_table.setEnabled(loaded)
         self.symbols_table.setEnabled(loaded)
         has_selection = loaded and bool(self._selected_section_bytes)
         self.export_action.setEnabled(has_selection)
@@ -1872,7 +2367,13 @@ class MainWindow(QMainWindow):
         self.function_filter_input.setEnabled(loaded)
         self.string_filter_input.setEnabled(loaded)
         self.import_filter_input.setEnabled(loaded)
+        self.export_filter_input.setEnabled(loaded)
+        self.relocation_filter_input.setEnabled(loaded)
         self.symbol_filter_input.setEnabled(loaded)
+        self.browser_tabs.setTabEnabled(self.symbols_browser_index, loaded)
+        self.details_tabs.setTabEnabled(self.export_details_tab_index, loaded)
+        self.details_tabs.setTabEnabled(self.relocation_details_tab_index, loaded)
+        self.details_tabs.setTabEnabled(self.symbol_details_tab_index, loaded)
         self.run_codex_action.setEnabled(_terminal_command() is not None and shutil.which("codex") is not None)
         self.run_gdb_action.setEnabled(
             loaded and self._current_path is not None and _terminal_command() is not None and GnuToolchain.has_gdb()
@@ -1969,6 +2470,42 @@ class MainWindow(QMainWindow):
         self.imports_table.setSortingEnabled(True)
         self.imports_table.sortItems(0, Qt.SortOrder.AscendingOrder)
 
+    def _populate_exports_table(self, exports: tuple[ExportInfo, ...]) -> None:
+        self.exports_table.setSortingEnabled(False)
+        self.exports_table.setRowCount(len(exports))
+        for row, export in enumerate(exports):
+            values = (
+                export.name,
+                _format_hex(export.address),
+                _format_int(export.size),
+                export.kind,
+                export.bind,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, export)
+                self.exports_table.setItem(row, column, item)
+        self.exports_table.setSortingEnabled(True)
+        self.exports_table.sortItems(1, Qt.SortOrder.AscendingOrder)
+
+    def _populate_relocations_table(self, relocations: tuple[RelocationInfo, ...]) -> None:
+        self.relocations_table.setSortingEnabled(False)
+        self.relocations_table.setRowCount(len(relocations))
+        for row, relocation in enumerate(relocations):
+            values = (
+                relocation.name,
+                _format_hex(relocation.address),
+                _format_hex(relocation.symbol_address),
+                relocation.kind,
+                "yes" if relocation.is_ifunc else "no",
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, relocation)
+                self.relocations_table.setItem(row, column, item)
+        self.relocations_table.setSortingEnabled(True)
+        self.relocations_table.sortItems(1, Qt.SortOrder.AscendingOrder)
+
     def _populate_import_xrefs_table(self, xrefs: tuple[XrefInfo, ...]) -> None:
         self.import_xrefs_table.setSortingEnabled(False)
         self.import_xrefs_table.setRowCount(len(xrefs))
@@ -1986,6 +2523,40 @@ class MainWindow(QMainWindow):
         self.import_xrefs_table.setSortingEnabled(True)
         self.import_xrefs_table.sortItems(0, Qt.SortOrder.AscendingOrder)
 
+    def _populate_export_xrefs_table(self, xrefs: tuple[XrefInfo, ...]) -> None:
+        self.export_xrefs_table.setSortingEnabled(False)
+        self.export_xrefs_table.setRowCount(len(xrefs))
+        for row, xref in enumerate(xrefs):
+            values = (
+                _format_hex(xref.from_address),
+                xref.function_name or "-",
+                xref.xref_type,
+                xref.opcode,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, xref)
+                self.export_xrefs_table.setItem(row, column, item)
+        self.export_xrefs_table.setSortingEnabled(True)
+        self.export_xrefs_table.sortItems(0, Qt.SortOrder.AscendingOrder)
+
+    def _populate_relocation_xrefs_table(self, xrefs: tuple[XrefInfo, ...]) -> None:
+        self.relocation_xrefs_table.setSortingEnabled(False)
+        self.relocation_xrefs_table.setRowCount(len(xrefs))
+        for row, xref in enumerate(xrefs):
+            values = (
+                _format_hex(xref.from_address),
+                xref.function_name or "-",
+                xref.xref_type,
+                xref.opcode,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, xref)
+                self.relocation_xrefs_table.setItem(row, column, item)
+        self.relocation_xrefs_table.setSortingEnabled(True)
+        self.relocation_xrefs_table.sortItems(0, Qt.SortOrder.AscendingOrder)
+
     def _populate_symbols_table(self, symbols: tuple[SymbolInfo, ...]) -> None:
         self.symbols_table.setSortingEnabled(False)
         self.symbols_table.setRowCount(len(symbols))
@@ -1995,7 +2566,7 @@ class MainWindow(QMainWindow):
                 symbol.demangled_name,
                 _format_hex(symbol.address),
                 symbol.kind,
-                "dynamic" if symbol.is_dynamic else "regular",
+                "imported" if symbol.is_dynamic else "defined",
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -2003,6 +2574,20 @@ class MainWindow(QMainWindow):
                 self.symbols_table.setItem(row, column, item)
         self.symbols_table.setSortingEnabled(True)
         self.symbols_table.sortItems(2, Qt.SortOrder.AscendingOrder)
+
+    def _populate_libraries_table(self, libraries: tuple[str, ...]) -> None:
+        self.libraries_table.setSortingEnabled(False)
+        self.libraries_table.setRowCount(len(libraries))
+        for row, library in enumerate(libraries):
+            item = QTableWidgetItem(library)
+            item.setData(Qt.ItemDataRole.UserRole, library)
+            self.libraries_table.setItem(row, 0, item)
+        self.libraries_table.setSortingEnabled(True)
+        if libraries:
+            self.libraries_table.sortItems(0, Qt.SortOrder.AscendingOrder)
+            self.library_summary_label.setText(f"{len(libraries):,} linked libraries")
+        else:
+            self.library_summary_label.setText("No linked libraries reported.")
 
     def _apply_section_filter(self, query: str) -> None:
         visible_rows = 0
@@ -2077,6 +2662,40 @@ class MainWindow(QMainWindow):
             self._clear_import_details()
             return
 
+    def _apply_export_filter(self, query: str) -> None:
+        visible_rows = 0
+        for row in range(self.exports_table.rowCount()):
+            item = self.exports_table.item(row, 0)
+            export = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            hidden = not isinstance(export, ExportInfo) or not _matches_export_filter(export, query)
+            self.exports_table.setRowHidden(row, hidden)
+            if not hidden:
+                visible_rows += 1
+        self.export_count_label.setText(f"{visible_rows} shown")
+        if visible_rows == 0:
+            self.exports_table.clearSelection()
+            self._selected_export_address = None
+            self._selected_export_name = None
+            self._clear_export_details()
+            return
+
+    def _apply_relocation_filter(self, query: str) -> None:
+        visible_rows = 0
+        for row in range(self.relocations_table.rowCount()):
+            item = self.relocations_table.item(row, 0)
+            relocation = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            hidden = not isinstance(relocation, RelocationInfo) or not _matches_relocation_filter(relocation, query)
+            self.relocations_table.setRowHidden(row, hidden)
+            if not hidden:
+                visible_rows += 1
+        self.relocation_count_label.setText(f"{visible_rows} shown")
+        if visible_rows == 0:
+            self.relocations_table.clearSelection()
+            self._selected_relocation_address = None
+            self._selected_relocation_name = None
+            self._clear_relocation_details()
+            return
+
     def _apply_symbol_filter(self, query: str) -> None:
         visible_rows = 0
         for row in range(self.symbols_table.rowCount()):
@@ -2142,7 +2761,7 @@ class MainWindow(QMainWindow):
         self._cfg_block_items.clear()
         self._selected_cfg_block_address = None
         self.function_demangled_value.setText("Loading demangled name...")
-        self.function_source_value.setText("Loading source lookup...")
+        self.function_source_value.setText(_source_lookup_message(self._current_image))
         self._set_status(f"Reading {function.name}...")
         self._thread_pool.start(FunctionDisassemblyWorker(self._current_path, function, self._signals))
         self._thread_pool.start(FunctionDecompilationWorker(self._current_path, function, self._signals))
@@ -2154,6 +2773,7 @@ class MainWindow(QMainWindow):
                 function.address,
                 "function",
                 self._signals,
+                include_source_lookup=_supports_gnu_elf_metadata(self._current_image),
             )
         )
 
@@ -2187,6 +2807,38 @@ class MainWindow(QMainWindow):
         self._set_status(f"Reading callers for import {imp.name}...")
         self._thread_pool.start(ImportXrefLoadWorker(self._current_path, imp, self._signals))
 
+    def _on_export_selection_changed(self) -> None:
+        selected_items = self.exports_table.selectedItems()
+        if not selected_items or self._current_path is None or self._loading_image:
+            return
+        export = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        if not isinstance(export, ExportInfo):
+            return
+        self._selected_export_address = export.address
+        self._selected_export_name = export.name
+        self.details_tabs.setCurrentIndex(self.export_details_tab_index)
+        self._update_export_details(export)
+        self.export_xref_summary_label.setText("Loading export xrefs from radare2...")
+        self.export_xrefs_table.setRowCount(0)
+        self._thread_pool.start(ExportXrefLoadWorker(self._current_path, export, self._signals))
+        self._set_status(f"Loaded export {export.name}", 4000)
+
+    def _on_relocation_selection_changed(self) -> None:
+        selected_items = self.relocations_table.selectedItems()
+        if not selected_items or self._current_path is None or self._loading_image:
+            return
+        relocation = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        if not isinstance(relocation, RelocationInfo):
+            return
+        self._selected_relocation_address = relocation.address
+        self._selected_relocation_name = relocation.name
+        self.details_tabs.setCurrentIndex(self.relocation_details_tab_index)
+        self._update_relocation_details(relocation)
+        self.relocation_xref_summary_label.setText("Loading relocation xrefs from radare2...")
+        self.relocation_xrefs_table.setRowCount(0)
+        self._thread_pool.start(RelocationXrefLoadWorker(self._current_path, relocation, self._signals))
+        self._set_status(f"Loaded relocation {relocation.name}", 4000)
+
     def _on_symbol_selection_changed(self) -> None:
         selected_items = self.symbols_table.selectedItems()
         if not selected_items or self._current_path is None or self._loading_image:
@@ -2196,7 +2848,7 @@ class MainWindow(QMainWindow):
             return
         self._selected_symbol_address = symbol.address
         self._selected_symbol_name = symbol.name
-        self.details_tabs.setCurrentIndex(4)
+        self.details_tabs.setCurrentIndex(self.symbol_details_tab_index)
         self._update_symbol_details(symbol)
         self._set_status(f"Reading GNU metadata for symbol {symbol.name}...")
         self._thread_pool.start(
@@ -2206,8 +2858,56 @@ class MainWindow(QMainWindow):
                 symbol.address,
                 "symbol",
                 self._signals,
+                include_source_lookup=_supports_gnu_elf_metadata(self._current_image),
             )
         )
+
+    def _navigate_selected_export(self, *_args: object) -> None:
+        selected_items = self.exports_table.selectedItems()
+        if not selected_items:
+            return
+        export = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        if not isinstance(export, ExportInfo) or export.address <= 0:
+            return
+        if self._select_function_by_address(export.address, scroll_address=export.address):
+            return
+        matched_function = self._find_function_by_name(export.name)
+        if matched_function is not None and self._select_function_by_address(
+            matched_function.address,
+            scroll_address=matched_function.address,
+        ):
+            return
+        if self._select_symbol_by_address(export.address, name=export.name):
+            return
+        if self._select_symbol_by_name(export.name):
+            return
+        self._set_status(f"No loaded function or symbol matched export {export.name}", 4000)
+
+    def _navigate_selected_relocation(self, *_args: object) -> None:
+        selected_items = self.relocations_table.selectedItems()
+        if not selected_items:
+            return
+        relocation = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        if not isinstance(relocation, RelocationInfo):
+            return
+        target_address = relocation.symbol_address if relocation.symbol_address > 0 else relocation.address
+        if target_address <= 0:
+            return
+        if self._select_function_by_address(target_address, scroll_address=target_address):
+            return
+        matched_function = self._find_function_by_name(relocation.name)
+        if matched_function is not None and self._select_function_by_address(
+            matched_function.address,
+            scroll_address=matched_function.address,
+        ):
+            return
+        if self._select_symbol_by_address(target_address, name=relocation.name):
+            return
+        if self._select_symbol_by_name(relocation.name):
+            return
+        if self._select_import_by_name(relocation.name):
+            return
+        self._navigate_to_address(target_address, prefer_section_scroll=True)
 
     def _navigate_selected_xref(self, *_args: object) -> None:
         selected_items = self.xrefs_table.selectedItems()
@@ -2220,6 +2920,24 @@ class MainWindow(QMainWindow):
 
     def _navigate_selected_import_xref(self, *_args: object) -> None:
         selected_items = self.import_xrefs_table.selectedItems()
+        if not selected_items:
+            return
+        xref = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        if not isinstance(xref, XrefInfo) or xref.function_address <= 0:
+            return
+        self._select_function_by_address(xref.function_address)
+
+    def _navigate_selected_export_xref(self, *_args: object) -> None:
+        selected_items = self.export_xrefs_table.selectedItems()
+        if not selected_items:
+            return
+        xref = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        if not isinstance(xref, XrefInfo) or xref.function_address <= 0:
+            return
+        self._select_function_by_address(xref.function_address)
+
+    def _navigate_selected_relocation_xref(self, *_args: object) -> None:
+        selected_items = self.relocation_xrefs_table.selectedItems()
         if not selected_items:
             return
         xref = selected_items[0].data(Qt.ItemDataRole.UserRole)
@@ -2310,6 +3028,91 @@ class MainWindow(QMainWindow):
             return True
         if scroll_address is None:
             self._set_status(f"No loaded function matched {_format_hex(address)}", 4000)
+        return False
+
+    def _find_function_by_name(self, name: str) -> FunctionInfo | None:
+        normalized = _normalized_lookup_name(name)
+        if not normalized:
+            return None
+        for function in self._functions:
+            candidates = {
+                _normalized_lookup_name(function.name),
+                _normalized_lookup_name(function.signature),
+            }
+            if normalized in candidates:
+                return function
+        return None
+
+    def _select_symbol_by_address(self, address: int, *, name: str | None = None) -> bool:
+        for row in range(self.symbols_table.rowCount()):
+            item = self.symbols_table.item(row, 0)
+            symbol = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if not isinstance(symbol, SymbolInfo) or symbol.address != address:
+                continue
+            if name is not None and symbol.name != name:
+                continue
+            self.details_tabs.setCurrentIndex(self.symbol_details_tab_index)
+            self.symbols_table.selectRow(row)
+            self._set_status(f"Navigated to symbol {symbol.name}", 4000)
+            return True
+        return False
+
+    def _find_symbol_by_name(self, name: str) -> SymbolInfo | None:
+        normalized = _normalized_lookup_name(name)
+        if not normalized:
+            return None
+        for symbol in self._symbols:
+            candidates = {
+                _normalized_lookup_name(symbol.name),
+                _normalized_lookup_name(symbol.demangled_name),
+            }
+            if normalized in candidates:
+                return symbol
+        return None
+
+    def _select_symbol_by_name(self, name: str) -> bool:
+        normalized = _normalized_lookup_name(name)
+        if not normalized:
+            return False
+        for row in range(self.symbols_table.rowCount()):
+            item = self.symbols_table.item(row, 0)
+            symbol = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if not isinstance(symbol, SymbolInfo):
+                continue
+            candidates = {
+                _normalized_lookup_name(symbol.name),
+                _normalized_lookup_name(symbol.demangled_name),
+            }
+            if normalized not in candidates:
+                continue
+            self.details_tabs.setCurrentIndex(self.symbol_details_tab_index)
+            self.symbols_table.selectRow(row)
+            self._set_status(f"Navigated to symbol {symbol.name}", 4000)
+            return True
+        return False
+
+    def _find_import_by_name(self, name: str) -> ImportInfo | None:
+        normalized = _normalized_lookup_name(name)
+        if not normalized:
+            return None
+        for imp in self._imports:
+            if _normalized_lookup_name(imp.name) == normalized:
+                return imp
+        return None
+
+    def _select_import_by_name(self, name: str) -> bool:
+        normalized = _normalized_lookup_name(name)
+        if not normalized:
+            return False
+        for row in range(self.imports_table.rowCount()):
+            item = self.imports_table.item(row, 0)
+            imp = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if not isinstance(imp, ImportInfo) or _normalized_lookup_name(imp.name) != normalized:
+                continue
+            self.details_tabs.setCurrentIndex(3)
+            self.imports_table.selectRow(row)
+            self._set_status(f"Navigated to import {imp.name}", 4000)
+            return True
         return False
 
     def _scroll_function_disassembly_to_address(self, address: int) -> None:
@@ -2423,7 +3226,7 @@ class MainWindow(QMainWindow):
         self.function_type_value.setText(function.kind)
         self.function_signature_value.setText(function.signature or "-")
         self.function_demangled_value.setText(function.name)
-        self.function_source_value.setText("Loading source lookup...")
+        self.function_source_value.setText(_source_lookup_message(self._current_image))
 
     def _update_string_details(self, string: StringInfo) -> None:
         self.string_value_label.setText(string.value)
@@ -2438,13 +3241,49 @@ class MainWindow(QMainWindow):
         self.import_bind_label.setText(imp.bind or "-")
         self.import_type_label.setText(imp.kind)
 
+    def _update_export_details(self, export: ExportInfo) -> None:
+        matched_function = self._find_function_by_name(export.name)
+        matched_symbol = self._find_symbol_by_name(export.name)
+        self.export_name_label.setText(export.name)
+        self.export_address_label.setText(_format_hex(export.address))
+        self.export_size_label.setText(f"{_format_int(export.size)} bytes")
+        self.export_type_label.setText(export.kind)
+        self.export_bind_label.setText(export.bind or "-")
+        self.export_function_label.setText(
+            f"{matched_function.name} @ {_format_hex(matched_function.address)}"
+            if matched_function is not None
+            else "No loaded function match"
+        )
+        self.export_symbol_label.setText(
+            f"{matched_symbol.name} @ {_format_hex(matched_symbol.address)}"
+            if matched_symbol is not None
+            else "No loaded symbol match"
+        )
+
+    def _update_relocation_details(self, relocation: RelocationInfo) -> None:
+        matched_function = self._find_function_by_name(relocation.name)
+        matched_import = self._find_import_by_name(relocation.name)
+        self.relocation_name_label.setText(relocation.name)
+        self.relocation_address_label.setText(_format_hex(relocation.address))
+        self.relocation_symbol_label.setText(_format_hex(relocation.symbol_address))
+        self.relocation_type_label.setText(relocation.kind)
+        self.relocation_ifunc_label.setText("yes" if relocation.is_ifunc else "no")
+        self.relocation_function_label.setText(
+            f"{matched_function.name} @ {_format_hex(matched_function.address)}"
+            if matched_function is not None
+            else "No loaded function match"
+        )
+        self.relocation_import_label.setText(
+            matched_import.name if matched_import is not None else "No loaded import match"
+        )
+
     def _update_symbol_details(self, symbol: SymbolInfo) -> None:
         self.symbol_name_label.setText(symbol.name)
         self.symbol_demangled_label.setText(symbol.demangled_name or symbol.name)
         self.symbol_address_label.setText(_format_hex(symbol.address))
         self.symbol_type_label.setText(symbol.kind)
-        self.symbol_origin_label.setText("dynamic" if symbol.is_dynamic else "regular")
-        self.symbol_source_label.setText("Loading source lookup...")
+        self.symbol_origin_label.setText("imported" if symbol.is_dynamic else "defined")
+        self.symbol_source_label.setText(_source_lookup_message(self._current_image))
 
     def _clear_section_details(self) -> None:
         self._current_section_disassembly = None
@@ -2508,6 +3347,32 @@ class MainWindow(QMainWindow):
         self.import_xref_summary_label.setText("Select an import to load callers.")
         self.import_xrefs_table.setRowCount(0)
 
+    def _clear_export_details(self) -> None:
+        self._selected_export_address = None
+        self._selected_export_name = None
+        self.export_name_label.setText("No export selected")
+        self.export_address_label.setText("-")
+        self.export_size_label.setText("-")
+        self.export_type_label.setText("-")
+        self.export_bind_label.setText("-")
+        self.export_function_label.setText("-")
+        self.export_symbol_label.setText("-")
+        self.export_xref_summary_label.setText("Select an export to load xrefs.")
+        self.export_xrefs_table.setRowCount(0)
+
+    def _clear_relocation_details(self) -> None:
+        self._selected_relocation_address = None
+        self._selected_relocation_name = None
+        self.relocation_name_label.setText("No relocation selected")
+        self.relocation_address_label.setText("-")
+        self.relocation_symbol_label.setText("-")
+        self.relocation_type_label.setText("-")
+        self.relocation_ifunc_label.setText("-")
+        self.relocation_function_label.setText("-")
+        self.relocation_import_label.setText("-")
+        self.relocation_xref_summary_label.setText("Select a relocation to load xrefs.")
+        self.relocation_xrefs_table.setRowCount(0)
+
     def _clear_symbol_details(self) -> None:
         self._selected_symbol_name = None
         self.symbol_name_label.setText("No symbol selected")
@@ -2522,6 +3387,8 @@ class MainWindow(QMainWindow):
         self._clear_function_details()
         self._clear_string_details()
         self._clear_import_details()
+        self._clear_export_details()
+        self._clear_relocation_details()
         self._clear_symbol_details()
 
     def export_selected_section(self) -> None:

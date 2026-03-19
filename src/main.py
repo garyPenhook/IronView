@@ -41,6 +41,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     {
                         "path": str(image.path),
                         "arch_size": image.arch_size,
+                        "target": image.target,
+                        "file_format": image.file_format,
                         "sections": [asdict(section) for section in image.sections],
                     },
                     indent=2,

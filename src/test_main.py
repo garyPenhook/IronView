@@ -1,3 +1,4 @@
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -7,12 +8,16 @@ from PySide6.QtWidgets import QApplication
 
 import src.binary_loader
 import src.gnu_toolchain
-from src.binary_loader import BinaryLoader, BinaryLoaderError
+from src.binary_loader import BinaryImage, BinaryLoader, BinaryLoaderError
 from src.disassembler import (
+    BinaryMetadataReport,
     ControlFlowBlock,
     ControlFlowEdge,
+    DecompilationAnnotation,
+    DecompilationLineMapping,
     DisassembledInstruction,
     DisassemblyResult,
+    ExportInfo,
     FunctionDecompilationResult,
     FunctionDisassemblyResult,
     FunctionGraphResult,
@@ -20,7 +25,10 @@ from src.disassembler import (
     ImportInfo,
     InstructionTarget,
     Radare2Disassembler,
+    Radare2DisassemblerError,
+    RelocationInfo,
     StringInfo,
+    XrefInfo,
     format_disassembly,
     format_disassembly_html,
     format_function_disassembly,
@@ -28,10 +36,15 @@ from src.disassembler import (
 )
 from src.gnu_toolchain import GnuToolchain, GnuToolchainError, SymbolInfo
 from src.gui import (
+    AddressMetadataWorker,
     DARK_THEME,
     ErrorInfo,
     LIGHT_THEME,
+    LoadedBinaryReport,
+    LoadedExportXrefs,
+    LoadedImage,
     LoadedFunctionDecompilation,
+    LoadedRelocationXrefs,
     MainWindow,
     _build_export_path,
     _find_cfg_block_address,
@@ -68,6 +81,8 @@ def test_loader_lists_sections(sample_binary: Path) -> None:
         image = loader.image()
 
     assert image.arch_size in (32, 64)
+    assert image.file_format == "ELF"
+    assert "elf" in image.target.lower()
     assert image.sections
     assert any(section.name == ".text" for section in image.sections)
 
@@ -150,6 +165,15 @@ def test_main_rejects_section_without_path() -> None:
     assert exc_info.value.code == 2
 
 
+def test_main_cli_json_includes_format_metadata(sample_binary: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main([str(sample_binary)]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["file_format"] == "ELF"
+    assert "elf" in payload["target"].lower()
+
+
 def test_matches_section_filter_checks_name_and_addresses(sample_binary: Path) -> None:
     with BinaryLoader(sample_binary) as loader:
         section = next(item for item in loader.image().sections if item.name == ".text")
@@ -210,13 +234,25 @@ def test_radare2_lists_functions_and_renders_function_disassembly(
 
 def test_radare2_decompile_function_returns_hll_text() -> None:
     class FakeR2:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
         def cmd(self, command: str) -> str:
-            assert command == "pdc @ 4198400"
-            return "int main(void) {\n    return 0;\n}\n"
+            self.commands.append(command)
+            if command == "pdg?":
+                return "You need to install the plugin with r2pm -ci r2ghidra"
+            if command == "pdd?":
+                return "You need to install the plugin with r2pm -ci r2dec"
+            if command == "pdc?":
+                return "Usage: pdc pseudo decompile function"
+            if command == "pdc @ 4198400":
+                return "int main(void) {\n    return 0;\n}\n"
+            raise AssertionError(command)
 
     function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
     disassembler = Radare2Disassembler("/bin/ls")
-    disassembler._r2 = FakeR2()
+    fake_r2 = FakeR2()
+    disassembler._r2 = fake_r2
     disassembler._architecture = "x86"
     disassembler._bits = 64
 
@@ -224,6 +260,150 @@ def test_radare2_decompile_function_returns_hll_text() -> None:
 
     assert result.backend == "pdc"
     assert "return 0;" in result.text
+    assert fake_r2.commands == ["pdg?", "pdd?", "pdc?", "pdc @ 4198400"]
+
+
+def test_radare2_decompile_function_includes_metadata_and_line_mappings() -> None:
+    class FakeR2:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def cmd(self, command: str) -> str:
+            self.commands.append(command)
+            responses = {
+                "pdg?": "You need to install the plugin with r2pm -ci r2ghidra",
+                "pdd?": "You need to install the plugin with r2pm -ci r2dec",
+                "pdc?": "Usage: pdc pseudo decompile function",
+                "pdc @ 4198400": "int main(void) {\n    return 0;\n}",
+            }
+            return responses[command]
+
+        def cmdj(self, command: str) -> dict[str, object]:
+            assert command == "pdcj @ 4198400"
+            return {
+                "code": "int main(void) {\n    return 0;\n}",
+                "annotations": [
+                    {"start": 0, "end": 2, "offset": 0x401000, "type": "offset"},
+                    {"start": 21, "end": 26, "offset": 0x401004, "type": "offset"},
+                ],
+            }
+
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
+    disassembler = Radare2Disassembler("/bin/ls")
+    fake_r2 = FakeR2()
+    disassembler._r2 = fake_r2
+    disassembler._architecture = "x86"
+    disassembler._bits = 64
+
+    result = disassembler.decompile_function(function)
+
+    assert result.backend == "pdc"
+    assert result.backend_display_name == "radare2 pseudo (pdc)"
+    assert result.available_backends == ("pdc",)
+    assert result.used_fallback is True
+    assert result.annotations == (
+        DecompilationAnnotation(start=0, end=2, address=0x401000, kind="offset"),
+        DecompilationAnnotation(start=21, end=26, address=0x401004, kind="offset"),
+    )
+    assert result.line_mappings == (
+        DecompilationLineMapping(line_number=1, start=0, end=17, addresses=(0x401000,)),
+        DecompilationLineMapping(line_number=2, start=17, end=31, addresses=(0x401004,)),
+    )
+    assert any("Preferred HLL backend pdg was unavailable" in warning for warning in result.warnings)
+    assert any("pdc output is heuristic" in warning for warning in result.warnings)
+    assert fake_r2.commands == ["pdg?", "pdd?", "pdc?", "pdc @ 4198400"]
+
+
+def test_radare2_lists_available_decompilation_backends_in_priority_order() -> None:
+    class FakeR2:
+        def cmd(self, command: str) -> str:
+            responses = {
+                "pdg?": "Usage: pdg decompile current function",
+                "pdd?": "You need to install the plugin with r2pm -ci r2dec",
+                "pdc?": "Usage: pdc pseudo decompile function",
+            }
+            return responses[command]
+
+    disassembler = Radare2Disassembler("/bin/ls")
+    disassembler._r2 = FakeR2()
+
+    assert disassembler.available_decompilation_backends() == ("pdg", "pdc")
+
+
+def test_radare2_decompile_function_prefers_richer_available_backend() -> None:
+    class FakeR2:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def cmd(self, command: str) -> str:
+            self.commands.append(command)
+            responses = {
+                "pdg?": "Usage: pdg decompile current function",
+                "pdd?": "Usage: pdd decompile current function",
+                "pdc?": "Usage: pdc pseudo decompile function",
+                "pdg @ 4198400": "int main(int argc, char **argv) {\n    return argc;\n}",
+            }
+            return responses[command]
+
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
+    disassembler = Radare2Disassembler("/bin/ls")
+    fake_r2 = FakeR2()
+    disassembler._r2 = fake_r2
+    disassembler._architecture = "x86"
+    disassembler._bits = 64
+
+    result = disassembler.decompile_function(function)
+
+    assert result.backend == "pdg"
+    assert "return argc;" in result.text
+    assert fake_r2.commands == ["pdg?", "pdd?", "pdc?", "pdg @ 4198400"]
+
+
+def test_radare2_decompile_function_allows_explicit_backend_selection() -> None:
+    class FakeR2:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def cmd(self, command: str) -> str:
+            self.commands.append(command)
+            responses = {
+                "pdg?": "Usage: pdg decompile current function",
+                "pdd?": "Usage: pdd decompile current function",
+                "pdc?": "Usage: pdc pseudo decompile function",
+                "pdd @ 4198400": "int main(void) {\n    return 1;\n}",
+            }
+            return responses[command]
+
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
+    disassembler = Radare2Disassembler("/bin/ls")
+    fake_r2 = FakeR2()
+    disassembler._r2 = fake_r2
+    disassembler._architecture = "x86"
+    disassembler._bits = 64
+
+    result = disassembler.decompile_function(function, backend="pdd")
+
+    assert result.backend == "pdd"
+    assert "return 1;" in result.text
+    assert fake_r2.commands == ["pdg?", "pdd?", "pdc?", "pdd @ 4198400"]
+
+
+def test_radare2_decompile_function_rejects_unavailable_explicit_backend() -> None:
+    class FakeR2:
+        def cmd(self, command: str) -> str:
+            responses = {
+                "pdg?": "You need to install the plugin with r2pm -ci r2ghidra",
+                "pdd?": "You need to install the plugin with r2pm -ci r2dec",
+                "pdc?": "Usage: pdc pseudo decompile function",
+            }
+            return responses[command]
+
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
+    disassembler = Radare2Disassembler("/bin/ls")
+    disassembler._r2 = FakeR2()
+
+    with pytest.raises(Radare2DisassemblerError, match="decompilation backend pdd is not available"):
+        disassembler.decompile_function(function, backend="pdd")
 
 
 def test_disassembly_html_renders_navigation_links() -> None:
@@ -363,6 +543,67 @@ def test_radare2_lists_imports_and_callers(
     assert any(xref.function_name == "main" for xref in xrefs)
 
 
+def test_radare2_lists_symbols(
+    has_radare2: bool,
+    sample_binary: Path,
+) -> None:
+    if not has_radare2:
+        pytest.skip("radare2 is not installed")
+
+    with Radare2Disassembler(sample_binary) as disassembler:
+        symbols = disassembler.list_symbols()
+
+    assert symbols
+    assert any(symbol.kind == "FUNC" for symbol in symbols)
+    assert any(symbol.is_dynamic for symbol in symbols)
+
+
+def test_radare2_lists_exports(
+    has_radare2: bool,
+    sample_binary: Path,
+) -> None:
+    if not has_radare2:
+        pytest.skip("radare2 is not installed")
+
+    with Radare2Disassembler(sample_binary) as disassembler:
+        exports = disassembler.list_exports()
+
+    assert exports
+    assert any(export.kind == "OBJ" for export in exports)
+
+
+def test_radare2_lists_relocations(
+    has_radare2: bool,
+    sample_binary: Path,
+) -> None:
+    if not has_radare2:
+        pytest.skip("radare2 is not installed")
+
+    with Radare2Disassembler(sample_binary) as disassembler:
+        relocations = disassembler.list_relocations()
+
+    assert relocations
+    assert any(relocation.kind for relocation in relocations)
+
+
+def test_radare2_inspects_binary_metadata(
+    has_radare2: bool,
+    sample_binary: Path,
+) -> None:
+    if not has_radare2:
+        pytest.skip("radare2 is not installed")
+
+    with Radare2Disassembler(sample_binary) as disassembler:
+        report = disassembler.inspect_binary()
+
+    assert "Format:" in report.text
+    assert "Sections (" in report.text
+    assert "Entrypoints (" in report.text
+    assert "Imports (" in report.text
+    assert "sections" in report.summary
+    assert report.libraries
+
+
 def test_radare2_builds_function_cfg(
     has_radare2: bool,
     sample_binary: Path,
@@ -494,7 +735,13 @@ def test_main_window_loads_function_decompilation(qt_app: QApplication) -> None:
         architecture="x86",
         bits=64,
         backend="pdc",
+        backend_display_name="radare2 pseudo (pdc)",
         text="int main(void) {\n    return 0;\n}",
+        used_fallback=True,
+        warnings=("Preferred HLL backend pdg was unavailable; using pdc instead.",),
+        line_mappings=(
+            DecompilationLineMapping(line_number=1, start=0, end=17, addresses=(0x401000,)),
+        ),
     )
     window._current_path = Path("/bin/ls")
     window._selected_function_address = function.address
@@ -508,7 +755,9 @@ def test_main_window_loads_function_decompilation(qt_app: QApplication) -> None:
     )
     qt_app.processEvents()
 
-    assert "pdc HLL-style decompilation" in window.function_decompilation_summary.text()
+    assert "radare2 pseudo (pdc) HLL-style decompilation" in window.function_decompilation_summary.text()
+    assert "Fallback backend in use." in window.function_decompilation_summary.text()
+    assert "1 correlated lines." in window.function_decompilation_summary.text()
     assert "return 0;" in window.function_decompilation_preview.toPlainText()
     window.close()
 
@@ -555,8 +804,121 @@ def test_main_window_import_filtering(qt_app: QApplication) -> None:
     window.close()
 
 
+def test_main_window_export_filtering(qt_app: QApplication) -> None:
+    window = MainWindow()
+    window._populate_exports_table(
+        (
+            ExportInfo("export_alpha", 0x4100, 16, "FUNC", "GLOBAL"),
+            ExportInfo("export_beta", 0x4200, 32, "OBJ", "GLOBAL"),
+        )
+    )
+    window._set_loaded_state(True)
+    qt_app.processEvents()
+    window.export_filter_input.setText("export_alpha")
+    qt_app.processEvents()
+
+    visible_rows = [
+        row for row in range(window.exports_table.rowCount()) if not window.exports_table.isRowHidden(row)
+    ]
+    assert visible_rows == [0]
+    assert window.export_count_label.text() == "1 shown"
+    window.close()
+
+
+def test_main_window_export_details_show_correlated_context(qt_app: QApplication) -> None:
+    window = MainWindow()
+    window._functions = (FunctionInfo("export_alpha", 0x4100, 16, 4, "sym", "export_alpha();"),)
+    window._symbols = (SymbolInfo("export_alpha", "export_alpha", 0x4100, "FUNC", 16, False),)
+
+    window._update_export_details(ExportInfo("export_alpha", 0x4100, 16, "FUNC", "GLOBAL"))
+    qt_app.processEvents()
+
+    assert "export_alpha @" in window.export_function_label.text()
+    assert "export_alpha @" in window.export_symbol_label.text()
+    window.close()
+
+
+def test_main_window_loads_export_xrefs(qt_app: QApplication) -> None:
+    window = MainWindow()
+    window._current_path = Path("/tmp/sample.bin")
+    window._selected_export_address = 0x4100
+
+    window._on_export_xrefs_loaded(
+        LoadedExportXrefs(
+            path=window._current_path,
+            export_address=0x4100,
+            xrefs=(XrefInfo(0x5000, "CODE", "r-x", "call 0x4100", 0x5000, "main", "export_alpha"),),
+        )
+    )
+    qt_app.processEvents()
+
+    assert window.export_xref_summary_label.text() == "1 xrefs loaded"
+    assert window.export_xrefs_table.rowCount() == 1
+    window.close()
+
+
+def test_main_window_relocation_filtering(qt_app: QApplication) -> None:
+    window = MainWindow()
+    window._populate_relocations_table(
+        (
+            RelocationInfo("puts", 0x5000, 0x4100, "JMP_SLOT", False),
+            RelocationInfo("exit", 0x5010, 0x4200, "GLOB_DAT", False),
+        )
+    )
+    window._set_loaded_state(True)
+    qt_app.processEvents()
+    window.relocation_filter_input.setText("puts")
+    qt_app.processEvents()
+
+    visible_rows = [
+        row for row in range(window.relocations_table.rowCount()) if not window.relocations_table.isRowHidden(row)
+    ]
+    assert visible_rows == [0]
+    assert window.relocation_count_label.text() == "1 shown"
+    window.close()
+
+
+def test_main_window_loads_relocation_xrefs(qt_app: QApplication) -> None:
+    window = MainWindow()
+    window._current_path = Path("/tmp/sample.bin")
+    window._selected_relocation_address = 0x5000
+
+    window._on_relocation_xrefs_loaded(
+        LoadedRelocationXrefs(
+            path=window._current_path,
+            relocation_address=0x5000,
+            xrefs=(XrefInfo(0x401000, "DATA", "r--", "lea rax, [0x5000]", 0x401000, "entry0", "puts"),),
+        )
+    )
+    qt_app.processEvents()
+
+    assert window.relocation_xref_summary_label.text() == "1 xrefs loaded"
+    assert window.relocation_xrefs_table.rowCount() == 1
+    window.close()
+
+
+def test_main_window_relocation_details_show_correlated_context(qt_app: QApplication) -> None:
+    window = MainWindow()
+    window._functions = (FunctionInfo("puts", 0x401000, 32, 8, "sym", "puts();"),)
+    window._imports = (ImportInfo("puts", "GLOBAL", "FUNC", 0x4030),)
+
+    window._update_relocation_details(RelocationInfo("puts", 0x5000, 0x4030, "JMP_SLOT", False))
+    qt_app.processEvents()
+
+    assert "puts @" in window.relocation_function_label.text()
+    assert window.relocation_import_label.text() == "puts"
+    window.close()
+
+
 def test_main_window_symbol_filtering(qt_app: QApplication) -> None:
     window = MainWindow()
+    window._current_image = BinaryImage(
+        path=Path("/tmp/sample.bin"),
+        arch_size=64,
+        target="elf64-x86-64",
+        file_format="ELF",
+        sections=(),
+    )
     window._populate_symbols_table(
         (
             SymbolInfo("_Z3foov", "foo()", 0x4100, "T", 16, False),
@@ -574,6 +936,145 @@ def test_main_window_symbol_filtering(qt_app: QApplication) -> None:
     assert len(visible_rows) == 1
     assert window.symbols_table.item(visible_rows[0], 1).text() == "foo()"
     assert window.symbol_count_label.text() == "1 shown"
+    window.close()
+
+
+def test_main_window_navigate_export_falls_back_to_name_match(qt_app: QApplication) -> None:
+    window = MainWindow()
+    function = FunctionInfo("export_alpha", 0x4100, 32, 6, "sym", "export_alpha();")
+    window._functions = (function,)
+    window._populate_functions_table((function,))
+    window._populate_exports_table((ExportInfo("export_alpha", 0x9000, 16, "FUNC", "GLOBAL"),))
+    window._set_loaded_state(True)
+    window.exports_table.selectRow(0)
+    qt_app.processEvents()
+
+    window._navigate_selected_export()
+    qt_app.processEvents()
+
+    assert window.functions_table.currentRow() == 0
+    window.close()
+
+
+def test_main_window_navigate_relocation_falls_back_to_import_name(qt_app: QApplication) -> None:
+    window = MainWindow()
+    imp = ImportInfo("puts", "GLOBAL", "FUNC", 0x4030)
+    window._imports = (imp,)
+    window._populate_imports_table((imp,))
+    window._populate_relocations_table((RelocationInfo("puts", 0x5000, 0x0, "JMP_SLOT", False),))
+    window._set_loaded_state(True)
+    window.relocations_table.selectRow(0)
+    qt_app.processEvents()
+
+    window._navigate_selected_relocation()
+    qt_app.processEvents()
+
+    assert window.imports_table.currentRow() == 0
+    window.close()
+
+
+def test_main_window_navigate_export_xref_selects_function(qt_app: QApplication) -> None:
+    window = MainWindow()
+    function = FunctionInfo("main", 0x5000, 32, 6, "sym", "main();")
+    window._functions = (function,)
+    window._populate_functions_table((function,))
+    window.export_xrefs_table.setRowCount(1)
+    item = window.export_xrefs_table.item(0, 0)
+    if item is None:
+        from PySide6.QtWidgets import QTableWidgetItem
+
+        values = ("0x5000", "main", "CODE", "call 0x4100")
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            item.setData(
+                256,
+                XrefInfo(0x5000, "CODE", "r-x", "call 0x4100", 0x5000, "main", "export_alpha"),
+            )
+            window.export_xrefs_table.setItem(0, column, item)
+    window.export_xrefs_table.selectRow(0)
+    window._set_loaded_state(True)
+    qt_app.processEvents()
+
+    window._navigate_selected_export_xref()
+    qt_app.processEvents()
+
+    assert window.functions_table.currentRow() == 0
+    window.close()
+
+
+def test_main_window_starts_binary_report_worker_for_pe_images(
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow()
+    image = BinaryImage(
+        path=Path("/tmp/sample.exe"),
+        arch_size=64,
+        target="pei-x86-64",
+        file_format="PE/COFF",
+        sections=(),
+    )
+    started_workers: list[object] = []
+    monkeypatch.setattr(window._thread_pool, "start", lambda worker: started_workers.append(worker))
+    window._current_path = image.path
+
+    window._on_image_loaded(LoadedImage(path=image.path, image=image))
+    qt_app.processEvents()
+
+    assert any(worker.__class__.__name__ == "SymbolListWorker" for worker in started_workers)
+    assert any(worker.__class__.__name__ == "BinaryReportWorker" for worker in started_workers)
+    assert any(worker.__class__.__name__ == "ExportListWorker" for worker in started_workers)
+    assert any(worker.__class__.__name__ == "RelocationListWorker" for worker in started_workers)
+    assert window.symbols_table.isEnabled()
+    assert window.format_value.text() == "PE/COFF"
+    assert "Loading PE/COFF metadata" in window.elf_summary_label.text()
+    window.close()
+
+
+def test_main_window_loads_binary_report(qt_app: QApplication) -> None:
+    window = MainWindow()
+    report = BinaryMetadataReport(
+        path=Path("/tmp/sample.exe"),
+        summary="pe | x86 64-bit | 5 sections | 1 entrypoints | 7 imports",
+        text="Format: pe\nSections (5)\nEntrypoints (1)\nImports (7)\n",
+        libraries=("KERNEL32.dll", "USER32.dll"),
+    )
+    window._current_path = report.path
+
+    window._on_binary_report_loaded(LoadedBinaryReport(path=report.path, report=report))
+    qt_app.processEvents()
+
+    assert window.elf_summary_label.text() == report.summary
+    assert "Entrypoints (1)" in window.elf_report_view.toPlainText()
+    assert window.library_summary_label.text() == "2 linked libraries"
+    assert window.libraries_table.rowCount() == 2
+    window.close()
+
+
+def test_main_window_function_metadata_skips_source_lookup_for_non_elf(
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow()
+    window._current_path = Path("/tmp/sample.exe")
+    window._current_image = BinaryImage(
+        path=window._current_path,
+        arch_size=64,
+        target="pei-x86-64",
+        file_format="PE/COFF",
+        sections=(),
+    )
+    started_workers: list[object] = []
+    monkeypatch.setattr(window._thread_pool, "start", lambda worker: started_workers.append(worker))
+    window._populate_functions_table((FunctionInfo("entry0", 0x401000, 32, 12, "sym", "entry0();"),))
+    window._set_loaded_state(True)
+
+    window.functions_table.selectRow(0)
+    qt_app.processEvents()
+
+    metadata_worker = next(worker for worker in started_workers if isinstance(worker, AddressMetadataWorker))
+    assert metadata_worker.include_source_lookup is False
+    assert window.function_source_value.text() == "Unavailable for PE/COFF binaries"
     window.close()
 
 
