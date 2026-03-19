@@ -181,9 +181,18 @@ class GnuToolchain:
         if is_dynamic:
             command.append("-D")
         command.append(str(self.path))
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        if result.returncode != 0 and not result.stdout:
-            return ""
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+        except FileNotFoundError as exc:
+            raise GnuToolchainError("nm is not installed on this system") from exc
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            if result.stdout and stderr:
+                raise GnuToolchainError(f"nm produced partial output: {stderr}")
+            if not result.stdout and stderr:
+                raise GnuToolchainError(f"nm failed: {stderr}")
+            if not result.stdout:
+                return ""
         return result.stdout
 
     def _run_command(

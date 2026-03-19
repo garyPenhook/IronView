@@ -8,12 +8,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
-from PySide6.QtCore import QObject, QProcess, QRunnable, Qt, QThreadPool, QUrl, Signal
-from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QFontDatabase
+from PySide6.QtCore import QObject, QPointF, QProcess, QRunnable, Qt, QThreadPool, QUrl, Signal
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QBrush,
+    QCloseEvent,
+    QColor,
+    QFontDatabase,
+    QPainter,
+    QPainterPath,
+    QPen,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QFormLayout,
+    QGraphicsRectItem,
+    QGraphicsScene,
+    QGraphicsTextItem,
+    QGraphicsView,
     QGroupBox,
     QHeaderView,
     QHBoxLayout,
@@ -38,9 +52,12 @@ from PySide6.QtWidgets import (
 
 from src.binary_loader import BinaryImage, BinaryLoader, BinaryLoaderError, SectionInfo
 from src.disassembler import (
+    ControlFlowBlock,
+    ControlFlowEdge,
     DEFAULT_INSTRUCTION_LIMIT,
     DisassemblyResult,
     FunctionDisassemblyResult,
+    FunctionGraphResult,
     FunctionInfo,
     ImportInfo,
     Radare2Disassembler,
@@ -220,6 +237,28 @@ def _source_text(source_location: SourceLocation | None) -> str:
     return source_location.display_text
 
 
+def _cfg_block_contains_address(block: ControlFlowBlock, address: int) -> bool:
+    if block.address == address:
+        return True
+    return block.size > 0 and block.address <= address < block.address + block.size
+
+
+def _find_cfg_block_address(blocks: tuple[ControlFlowBlock, ...], address: int) -> int | None:
+    for block in blocks:
+        if _cfg_block_contains_address(block, address):
+            return block.address
+    return None
+
+
+def _cfg_preview_text(block: ControlFlowBlock, *, limit: int = 4) -> str:
+    lines = [f"{_format_hex(block.address)}  ({len(block.instructions)} instr)"]
+    for instruction in block.instructions[:limit]:
+        lines.append(f"{instruction.address:08X}  {instruction.text}")
+    if len(block.instructions) > limit:
+        lines.append("...")
+    return "\n".join(lines)
+
+
 def _shell_path() -> str:
     return os.environ.get("SHELL") or "/bin/sh"
 
@@ -256,7 +295,7 @@ QGroupBox::title {
     padding: 0 4px;
     color: #9db3c8;
 }
-QTableWidget, QPlainTextEdit, QTextBrowser, QLineEdit {
+QTableWidget, QPlainTextEdit, QTextBrowser, QGraphicsView, QLineEdit {
     background: #0f141a;
     border: 1px solid #314152;
     border-radius: 6px;
@@ -320,6 +359,14 @@ class LoadedFunctionDisassembly:
 
 
 @dataclass(frozen=True, slots=True)
+class LoadedFunctionGraph:
+    path: Path
+    function_address: int
+    result: FunctionGraphResult | None
+    message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class LoadedStrings:
     path: Path
     strings: tuple[StringInfo, ...]
@@ -368,12 +415,19 @@ class LoadedAddressMetadata:
     source_location: SourceLocation | None
 
 
+@dataclass(frozen=True, slots=True)
+class ErrorInfo:
+    title: str
+    message: str
+
+
 class WorkerSignals(QObject):
     loaded_image = Signal(object)
     loaded_section = Signal(str, bytes)
     loaded_disassembly = Signal(object)
     loaded_functions = Signal(object)
     loaded_function_disassembly = Signal(object)
+    loaded_function_graph = Signal(object)
     loaded_strings = Signal(object)
     loaded_xrefs = Signal(object)
     loaded_imports = Signal(object)
@@ -381,7 +435,7 @@ class WorkerSignals(QObject):
     loaded_symbols = Signal(object)
     loaded_elf_report = Signal(object)
     loaded_address_metadata = Signal(object)
-    error = Signal(str)
+    error = Signal(object)
 
 
 def _safe_emit(signal: Signal, *args: object) -> bool:
@@ -390,6 +444,30 @@ def _safe_emit(signal: Signal, *args: object) -> bool:
     except RuntimeError:
         return False
     return True
+
+
+def _emit_error(signals: WorkerSignals, title: str, message: str) -> bool:
+    return _safe_emit(signals.error, ErrorInfo(title=title, message=message))
+
+
+class FunctionGraphView(QGraphicsView):
+    blockActivated = Signal(int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        item = self.itemAt(event.position().toPoint())
+        while item is not None:
+            address = item.data(0)
+            if isinstance(address, int):
+                self.blockActivated.emit(address)
+                break
+            item = item.parentItem()
+        super().mousePressEvent(event)
 
 
 class ImageLoadWorker(QRunnable):
@@ -403,7 +481,7 @@ class ImageLoadWorker(QRunnable):
             with BinaryLoader(self.path) as loader:
                 image = loader.image()
         except BinaryLoaderError as exc:
-            _safe_emit(self.signals.error, str(exc))
+            _emit_error(self.signals, "Binary Loader Error", str(exc))
             return
         _safe_emit(self.signals.loaded_image, LoadedImage(self.path, image))
 
@@ -420,7 +498,7 @@ class SectionLoadWorker(QRunnable):
             with BinaryLoader(self.path) as loader:
                 section_bytes = loader.read_section(self.section_name)
         except BinaryLoaderError as exc:
-            _safe_emit(self.signals.error, str(exc))
+            _emit_error(self.signals, "Binary Loader Error", str(exc))
             return
         _safe_emit(self.signals.loaded_section, self.section_name, section_bytes)
 
@@ -482,7 +560,7 @@ class FunctionListWorker(QRunnable):
             with Radare2Disassembler(self.path) as disassembler:
                 functions = disassembler.list_functions()
         except Radare2DisassemblerError as exc:
-            _safe_emit(self.signals.error, str(exc))
+            _emit_error(self.signals, "Radare2 Error", str(exc))
             return
         _safe_emit(self.signals.loaded_functions, LoadedFunctions(path=self.path, functions=functions))
 
@@ -519,6 +597,38 @@ class FunctionDisassemblyWorker(QRunnable):
         )
 
 
+class FunctionGraphWorker(QRunnable):
+    def __init__(self, path: Path, function: FunctionInfo, signals: WorkerSignals) -> None:
+        super().__init__()
+        self.path = path
+        self.function = function
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            with Radare2Disassembler(self.path) as disassembler:
+                result = disassembler.analyze_function_graph(self.function)
+        except Radare2DisassemblerError as exc:
+            _safe_emit(
+                self.signals.loaded_function_graph,
+                LoadedFunctionGraph(
+                    path=self.path,
+                    function_address=self.function.address,
+                    result=None,
+                    message=str(exc),
+                ),
+            )
+            return
+        _safe_emit(
+            self.signals.loaded_function_graph,
+            LoadedFunctionGraph(
+                path=self.path,
+                function_address=self.function.address,
+                result=result,
+            ),
+        )
+
+
 class StringListWorker(QRunnable):
     def __init__(self, path: Path, signals: WorkerSignals) -> None:
         super().__init__()
@@ -530,7 +640,7 @@ class StringListWorker(QRunnable):
             with Radare2Disassembler(self.path) as disassembler:
                 strings = disassembler.list_strings()
         except Radare2DisassemblerError as exc:
-            _safe_emit(self.signals.error, str(exc))
+            _emit_error(self.signals, "Radare2 Error", str(exc))
             return
         _safe_emit(self.signals.loaded_strings, LoadedStrings(path=self.path, strings=strings))
 
@@ -547,7 +657,7 @@ class XrefLoadWorker(QRunnable):
             with Radare2Disassembler(self.path) as disassembler:
                 xrefs = disassembler.list_xrefs_to(self.string.address)
         except Radare2DisassemblerError as exc:
-            _safe_emit(self.signals.error, str(exc))
+            _emit_error(self.signals, "Radare2 Error", str(exc))
             return
         _safe_emit(
             self.signals.loaded_xrefs,
@@ -566,7 +676,7 @@ class ImportListWorker(QRunnable):
             with Radare2Disassembler(self.path) as disassembler:
                 imports = disassembler.list_imports()
         except Radare2DisassemblerError as exc:
-            _safe_emit(self.signals.error, str(exc))
+            _emit_error(self.signals, "Radare2 Error", str(exc))
             return
         _safe_emit(self.signals.loaded_imports, LoadedImports(path=self.path, imports=imports))
 
@@ -583,7 +693,7 @@ class ImportXrefLoadWorker(QRunnable):
             with Radare2Disassembler(self.path) as disassembler:
                 xrefs = disassembler.list_xrefs_to_import(self.imp.name)
         except Radare2DisassemblerError as exc:
-            _safe_emit(self.signals.error, str(exc))
+            _emit_error(self.signals, "Radare2 Error", str(exc))
             return
         _safe_emit(
             self.signals.loaded_import_xrefs,
@@ -601,7 +711,7 @@ class SymbolListWorker(QRunnable):
         try:
             symbols = GnuToolchain(self.path).list_symbols()
         except GnuToolchainError as exc:
-            _safe_emit(self.signals.error, str(exc))
+            _emit_error(self.signals, "GNU Toolchain Error", str(exc))
             return
         _safe_emit(self.signals.loaded_symbols, LoadedSymbols(path=self.path, symbols=symbols))
 
@@ -636,7 +746,7 @@ class AddressMetadataWorker(QRunnable):
             demangled_name = toolchain.demangle(self.raw_name)
             source_location = toolchain.lookup_source(self.address) if self.address > 0 else None
         except GnuToolchainError as exc:
-            _safe_emit(self.signals.error, str(exc))
+            _emit_error(self.signals, "GNU Toolchain Error", str(exc))
             return
         _safe_emit(
             self.signals.loaded_address_metadata,
@@ -662,6 +772,7 @@ class MainWindow(QMainWindow):
         self._signals.loaded_disassembly.connect(self._on_disassembly_loaded)
         self._signals.loaded_functions.connect(self._on_functions_loaded)
         self._signals.loaded_function_disassembly.connect(self._on_function_disassembly_loaded)
+        self._signals.loaded_function_graph.connect(self._on_function_graph_loaded)
         self._signals.loaded_strings.connect(self._on_strings_loaded)
         self._signals.loaded_xrefs.connect(self._on_xrefs_loaded)
         self._signals.loaded_imports.connect(self._on_imports_loaded)
@@ -679,6 +790,7 @@ class MainWindow(QMainWindow):
         self._readelf_report: str = ""
         self._current_section_disassembly: DisassemblyResult | None = None
         self._current_function_disassembly: FunctionDisassemblyResult | None = None
+        self._current_function_graph: FunctionGraphResult | None = None
         self._pending_function_scroll_address: int | None = None
         self._selected_section: str | None = None
         self._selected_function_address: int | None = None
@@ -687,6 +799,8 @@ class MainWindow(QMainWindow):
         self._selected_symbol_address: int | None = None
         self._selected_symbol_name: str | None = None
         self._selected_section_bytes = b""
+        self._cfg_block_items: dict[int, QGraphicsRectItem] = {}
+        self._selected_cfg_block_address: int | None = None
         self._loading_image = False
         self._theme = LIGHT_THEME
         self._command_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -1220,11 +1334,6 @@ class MainWindow(QMainWindow):
         detail_form.addRow("Demangled", self.function_demangled_value)
         detail_form.addRow("Source", self.function_source_value)
 
-        function_preview_label = QLabel("Function Disassembly")
-        function_preview_font = function_preview_label.font()
-        function_preview_font.setBold(True)
-        function_preview_label.setFont(function_preview_font)
-
         self.function_disassembly_summary = QLabel(
             "Select a radare2 function to preview its full disassembly."
         )
@@ -1241,10 +1350,34 @@ class MainWindow(QMainWindow):
             "Select a function from the radare2 browser to preview its disassembly."
         )
 
+        disassembly_tab = QWidget(parent)
+        disassembly_layout = QVBoxLayout(disassembly_tab)
+        disassembly_layout.setContentsMargins(0, 0, 0, 0)
+        disassembly_layout.setSpacing(8)
+        disassembly_layout.addWidget(self.function_disassembly_summary)
+        disassembly_layout.addWidget(self.function_disassembly_preview, stretch=1)
+
+        self.function_cfg_summary = QLabel("Select a radare2 function to preview its control-flow graph.")
+        self.function_cfg_summary.setProperty("role", "muted")
+        self.function_cfg_scene = QGraphicsScene(parent)
+        self.function_cfg_view = FunctionGraphView(parent)
+        self.function_cfg_view.setScene(self.function_cfg_scene)
+        self.function_cfg_view.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
+        self.function_cfg_view.blockActivated.connect(self._on_function_cfg_block_activated)
+
+        cfg_tab = QWidget(parent)
+        cfg_layout = QVBoxLayout(cfg_tab)
+        cfg_layout.setContentsMargins(0, 0, 0, 0)
+        cfg_layout.setSpacing(8)
+        cfg_layout.addWidget(self.function_cfg_summary)
+        cfg_layout.addWidget(self.function_cfg_view, stretch=1)
+
+        self.function_preview_tabs = QTabWidget(parent)
+        self.function_preview_tabs.addTab(disassembly_tab, "Disassembly")
+        self.function_preview_tabs.addTab(cfg_tab, "CFG")
+
         layout.addLayout(detail_form)
-        layout.addWidget(function_preview_label)
-        layout.addWidget(self.function_disassembly_summary)
-        layout.addWidget(self.function_disassembly_preview, stretch=1)
+        layout.addWidget(self.function_preview_tabs, stretch=1)
         return tab
 
     def _build_string_details_tab(self, parent: QWidget) -> QWidget:
@@ -1428,6 +1561,7 @@ class MainWindow(QMainWindow):
         self._readelf_report = ""
         self._current_section_disassembly = None
         self._current_function_disassembly = None
+        self._current_function_graph = None
         self._pending_function_scroll_address = None
         self._selected_section = None
         self._selected_function_address = None
@@ -1436,6 +1570,8 @@ class MainWindow(QMainWindow):
         self._selected_symbol_address = None
         self._selected_symbol_name = None
         self._selected_section_bytes = b""
+        self._selected_cfg_block_address = None
+        self._cfg_block_items.clear()
         self._set_loaded_state(False)
         self.path_value.setText(str(self._current_path))
         self.preview.setPlainText("")
@@ -1533,9 +1669,32 @@ class MainWindow(QMainWindow):
         )
         self.function_disassembly_preview.setHtml(format_function_disassembly_html(loaded.result))
         if self._pending_function_scroll_address is not None:
+            self._highlight_cfg_block(self._pending_function_scroll_address)
             self._scroll_function_disassembly_to_address(self._pending_function_scroll_address)
             self._pending_function_scroll_address = None
         self._set_status(f"Loaded function disassembly for {function.name}", 4000)
+
+    def _on_function_graph_loaded(self, loaded: LoadedFunctionGraph) -> None:
+        if self._current_path != loaded.path or self._selected_function_address != loaded.function_address:
+            return
+        if loaded.result is None:
+            self._current_function_graph = None
+            self.function_cfg_summary.setText(loaded.message)
+            self.function_cfg_scene.clear()
+            self._cfg_block_items.clear()
+            self._selected_cfg_block_address = None
+            self._set_status(loaded.message, 4000)
+            return
+        self._current_function_graph = loaded.result
+        self._render_function_graph(loaded.result)
+        self.function_cfg_summary.setText(
+            f"{len(loaded.result.blocks):,} blocks, {len(loaded.result.edges):,} edges. Click a block to jump into disassembly."
+        )
+        if self._pending_function_scroll_address is not None:
+            self._highlight_cfg_block(self._pending_function_scroll_address)
+        else:
+            self._highlight_cfg_block(loaded.result.function.address)
+        self._set_status(f"Loaded CFG for {loaded.result.function.name}", 4000)
 
     def _on_strings_loaded(self, loaded: LoadedStrings) -> None:
         if self._current_path != loaded.path:
@@ -1604,10 +1763,16 @@ class MainWindow(QMainWindow):
             self.symbol_demangled_label.setText(loaded.demangled_name or loaded.raw_name)
             self.symbol_source_label.setText(_source_text(loaded.source_location))
 
-    def _show_error(self, message: str) -> None:
+    def _show_error(self, error: ErrorInfo | str) -> None:
+        if isinstance(error, ErrorInfo):
+            title = error.title
+            message = error.message
+        else:
+            title = "IronView Error"
+            message = error
         self._loading_image = False
         self._set_status(message, 6000)
-        QMessageBox.critical(self, "Binary Loader Error", message)
+        QMessageBox.critical(self, title, message)
         if self._current_image is None:
             self._set_loaded_state(False)
             self._clear_details()
@@ -1882,14 +2047,21 @@ class MainWindow(QMainWindow):
         if not isinstance(function, FunctionInfo):
             return
         self._selected_function_address = function.address
+        self._current_function_graph = None
         self.details_tabs.setCurrentIndex(1)
         self._update_function_details(function)
+        self.function_preview_tabs.setCurrentIndex(0)
         self.function_disassembly_summary.setText("Loading function disassembly from radare2...")
         self.function_disassembly_preview.setPlainText("Loading function disassembly...")
+        self.function_cfg_summary.setText("Loading control-flow graph from radare2...")
+        self.function_cfg_scene.clear()
+        self._cfg_block_items.clear()
+        self._selected_cfg_block_address = None
         self.function_demangled_value.setText("Loading demangled name...")
         self.function_source_value.setText("Loading source lookup...")
         self._set_status(f"Reading {function.name}...")
         self._thread_pool.start(FunctionDisassemblyWorker(self._current_path, function, self._signals))
+        self._thread_pool.start(FunctionGraphWorker(self._current_path, function, self._signals))
         self._thread_pool.start(
             AddressMetadataWorker(
                 self._current_path,
@@ -1981,6 +2153,11 @@ class MainWindow(QMainWindow):
             return
         self._set_status(f"No loaded function matched symbol {symbol.name}", 4000)
 
+    def _on_function_cfg_block_activated(self, address: int) -> None:
+        self._highlight_cfg_block(address)
+        self.function_preview_tabs.setCurrentIndex(0)
+        self._navigate_to_address(address, prefer_section_scroll=False)
+
     def _navigate_section_disassembly_target(self, url: QUrl) -> None:
         address = self._parse_navigation_target(url)
         if address is None:
@@ -2008,6 +2185,8 @@ class MainWindow(QMainWindow):
             and _function_contains_address(self._current_function_disassembly.function, address)
         ):
             self.details_tabs.setCurrentIndex(1)
+            self.function_preview_tabs.setCurrentIndex(0)
+            self._highlight_cfg_block(address)
             self._scroll_function_disassembly_to_address(address)
             self._set_status(
                 f"Navigated to {_format_hex(address)} in {self._current_function_disassembly.function.name}",
@@ -2038,6 +2217,8 @@ class MainWindow(QMainWindow):
                 and self._current_function_disassembly.function.address == function.address
             ):
                 if scroll_address is not None:
+                    self._highlight_cfg_block(scroll_address)
+                    self.function_preview_tabs.setCurrentIndex(0)
                     self._scroll_function_disassembly_to_address(scroll_address)
                     self._pending_function_scroll_address = None
                 self._set_status(f"Navigated to function {function.name}", 4000)
@@ -2048,6 +2229,96 @@ class MainWindow(QMainWindow):
 
     def _scroll_function_disassembly_to_address(self, address: int) -> None:
         self.function_disassembly_preview.scrollToAnchor(_address_anchor(address))
+
+    def _highlight_cfg_block(self, address: int) -> None:
+        if self._current_function_graph is None:
+            return
+        block_address = _find_cfg_block_address(self._current_function_graph.blocks, address)
+        if block_address is None:
+            return
+        default_brush = QBrush(QColor("#1b2430"))
+        selected_brush = QBrush(QColor("#1f6feb"))
+        for candidate_address, item in self._cfg_block_items.items():
+            item.setBrush(selected_brush if candidate_address == block_address else default_brush)
+        self._selected_cfg_block_address = block_address
+        self.function_cfg_view.centerOn(self._cfg_block_items[block_address])
+
+    def _render_function_graph(self, result: FunctionGraphResult) -> None:
+        self._current_function_graph = result
+        self.function_cfg_scene.clear()
+        self._cfg_block_items.clear()
+        self._selected_cfg_block_address = None
+        if not result.blocks:
+            return
+
+        entry_address = result.function.address
+        depths: dict[int, int] = {entry_address: 0}
+        changed = True
+        while changed:
+            changed = False
+            for edge in result.edges:
+                source_depth = depths.get(edge.source_address)
+                if source_depth is None:
+                    continue
+                target_depth = source_depth + 1
+                current_depth = depths.get(edge.target_address)
+                if current_depth is None or target_depth < current_depth:
+                    depths[edge.target_address] = target_depth
+                    changed = True
+
+        block_positions: dict[int, QPointF] = {}
+        fixed_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        fixed_font.setPointSize(max(fixed_font.pointSize() - 1, 8))
+        block_width = 360.0
+        block_height = 118.0
+        horizontal_gap = 110.0
+        vertical_gap = 34.0
+
+        for row, block in enumerate(result.blocks):
+            depth = depths.get(block.address, 0)
+            x = depth * (block_width + horizontal_gap)
+            y = row * (block_height + vertical_gap)
+            position = QPointF(x, y)
+            block_positions[block.address] = position
+
+            rect_item = self.function_cfg_scene.addRect(
+                x,
+                y,
+                block_width,
+                block_height,
+                QPen(QColor("#4b5b70"), 1.5),
+                QBrush(QColor("#1b2430")),
+            )
+            rect_item.setData(0, block.address)
+            self._cfg_block_items[block.address] = rect_item
+
+            text_item = QGraphicsTextItem(_cfg_preview_text(block), rect_item)
+            text_item.setDefaultTextColor(QColor("#eef2f7"))
+            text_item.setFont(fixed_font)
+            text_item.setPos(10, 8)
+
+        for edge in result.edges:
+            source_position = block_positions.get(edge.source_address)
+            target_position = block_positions.get(edge.target_address)
+            if source_position is None or target_position is None:
+                continue
+            source_point = QPointF(source_position.x() + block_width, source_position.y() + (block_height / 2))
+            target_point = QPointF(target_position.x(), target_position.y() + (block_height / 2))
+            mid_x = (source_point.x() + target_point.x()) / 2
+            path = QPainterPath(source_point)
+            path.cubicTo(
+                QPointF(mid_x, source_point.y()),
+                QPointF(mid_x, target_point.y()),
+                target_point,
+            )
+            edge_color = QColor("#3fb950") if edge.kind == "jump" else QColor("#d29922")
+            self.function_cfg_scene.addPath(path, QPen(edge_color, 2.0))
+            label_item = self.function_cfg_scene.addText(edge.kind.upper(), fixed_font)
+            label_item.setDefaultTextColor(edge_color)
+            label_item.setPos(mid_x - 18, (source_point.y() + target_point.y()) / 2 - 10)
+
+        bounds = self.function_cfg_scene.itemsBoundingRect()
+        self.function_cfg_scene.setSceneRect(bounds.adjusted(-40, -30, 40, 30))
 
     def _update_details(self, section: SectionInfo) -> None:
         self.detail_name.setText(section.name)
@@ -2111,7 +2382,10 @@ class MainWindow(QMainWindow):
 
     def _clear_function_details(self) -> None:
         self._current_function_disassembly = None
+        self._current_function_graph = None
         self._pending_function_scroll_address = None
+        self._selected_cfg_block_address = None
+        self._cfg_block_items.clear()
         self.function_name_value.setText("No function selected")
         self.function_address_value.setText("-")
         self.function_size_value.setText("-")
@@ -2124,6 +2398,8 @@ class MainWindow(QMainWindow):
             "Select a radare2 function to preview its full disassembly."
         )
         self.function_disassembly_preview.setPlainText("")
+        self.function_cfg_summary.setText("Select a radare2 function to preview its control-flow graph.")
+        self.function_cfg_scene.clear()
 
     def _clear_string_details(self) -> None:
         self.string_value_label.setText("No string selected")
@@ -2170,7 +2446,16 @@ class MainWindow(QMainWindow):
         if not target:
             return
         output_path = Path(target)
-        output_path.write_bytes(self._selected_section_bytes)
+        try:
+            output_path.write_bytes(self._selected_section_bytes)
+        except OSError as exc:
+            self._show_error(
+                ErrorInfo(
+                    title="Export Error",
+                    message=f"failed to export {self._selected_section} to {output_path}: {exc}",
+                )
+            )
+            return
         self.preview_hint.setText(f"Exported {len(self._selected_section_bytes):,} bytes.")
         self._set_status(f"Exported {self._selected_section} to {output_path}", 5000)
 

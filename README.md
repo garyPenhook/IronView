@@ -21,6 +21,7 @@ The project supports both GUI and CLI workflows.
 - Browse radare2-discovered strings
 - Browse radare2 imports
 - Browse GNU `nm` symbols
+- Inspect radare2 function CFGs
 - Filter functions by name, address, type, or signature
 - Filter strings by value, address, section, or type
 - Filter imports by name, PLT address, bind, or type
@@ -47,14 +48,14 @@ The project supports both GUI and CLI workflows.
 - GNU userland tools: `addr2line`, `c++filt`, `nm`, `readelf`, and optionally `gdb`
 - A Linux desktop session for the GUI
 
-Project dependencies are managed in [`pyproject.toml`](/home/gary/PycharmProjects/new_app/pyproject.toml).
+Project dependencies are managed in [`pyproject.toml`](/home/gary/PycharmProjects/IronView/pyproject.toml).
 
 ## Install
 
 From the project root:
 
 ```bash
-cd /home/gary/PycharmProjects/new_app
+cd /home/gary/PycharmProjects/IronView
 uv sync
 ```
 
@@ -69,7 +70,7 @@ If the project environment does not exist yet, `uv sync` will create it and inst
 Launch the GUI:
 
 ```bash
-cd /home/gary/PycharmProjects/new_app
+cd /home/gary/PycharmProjects/IronView
 uv run python -m src.main
 ```
 
@@ -102,15 +103,16 @@ uv run python -m src.main /bin/ls --section .text
 7. Select a string to load xrefs, then double-click an xref row to jump to the referenced function when available.
 8. Select an import to load callers, then double-click a caller row to jump to the referenced function when available.
 9. Select a function or symbol to load GNU demangling and source-location metadata.
-10. Use the `ELF` tab to inspect the current binary through `readelf`.
-11. Use the bottom `System Console` to watch loads, exports, errors, and analysis activity.
-12. Enter Linux commands in the console input and run them in the project directory.
-13. Use `Run Codex` to launch `codex` in an external terminal with a real TTY.
-14. Use `Run GDB` to launch `gdb` for the current binary in an external terminal.
+10. Use the `CFG` sub-tab inside the function inspector to review basic blocks and click a block to jump into disassembly.
+11. Use the `ELF` tab to inspect the current binary through `readelf`.
+12. Use the bottom `System Console` to watch loads, exports, errors, and analysis activity.
+13. Enter Linux commands in the console input and run them in the project directory.
+14. Use `Run Codex` to launch `codex` in an external terminal with a real TTY.
+15. Use `Run GDB` to launch `gdb` for the current binary in an external terminal.
 
 ## CLI Behavior
 
-[`src/main.py`](/home/gary/PycharmProjects/new_app/src/main.py) currently behaves like this:
+[`src/main.py`](/home/gary/PycharmProjects/IronView/src/main.py) currently behaves like this:
 
 - No positional `path`: launch the Qt GUI
 - `path` only: print JSON with path, architecture size, and sections
@@ -119,22 +121,22 @@ uv run python -m src.main /bin/ls --section .text
 
 ## Architecture
 
-Implementation details are documented in [`docs/architecture.md`](/home/gary/PycharmProjects/new_app/docs/architecture.md).
+Implementation details are documented in [`docs/architecture.md`](/home/gary/PycharmProjects/IronView/docs/architecture.md).
 
 At a high level:
 
-- [`src/binary_loader.py`](/home/gary/PycharmProjects/new_app/src/binary_loader.py) wraps `libbfd`
-- [`src/disassembler.py`](/home/gary/PycharmProjects/new_app/src/disassembler.py) wraps `radare2`
-- [`src/gnu_toolchain.py`](/home/gary/PycharmProjects/new_app/src/gnu_toolchain.py) wraps GNU binutils helpers
-- [`src/gui.py`](/home/gary/PycharmProjects/new_app/src/gui.py) implements the Qt application
-- [`src/main.py`](/home/gary/PycharmProjects/new_app/src/main.py) is the CLI/GUI entrypoint
+- [`src/binary_loader.py`](/home/gary/PycharmProjects/IronView/src/binary_loader.py) wraps `libbfd`
+- [`src/disassembler.py`](/home/gary/PycharmProjects/IronView/src/disassembler.py) wraps `radare2`
+- [`src/gnu_toolchain.py`](/home/gary/PycharmProjects/IronView/src/gnu_toolchain.py) wraps GNU binutils helpers
+- [`src/gui.py`](/home/gary/PycharmProjects/IronView/src/gui.py) implements the Qt application
+- [`src/main.py`](/home/gary/PycharmProjects/IronView/src/main.py) is the CLI/GUI entrypoint
 
 ## Verification
 
 Run the test suite:
 
 ```bash
-cd /home/gary/PycharmProjects/new_app
+cd /home/gary/PycharmProjects/IronView
 QT_QPA_PLATFORM=offscreen uv run pytest
 ```
 
@@ -150,4 +152,4 @@ python3 -m py_compile src/gnu_toolchain.py src/disassembler.py src/gui.py src/ma
 - `libbfd` must be available at runtime or section loading will fail.
 - radare2 is used for read-only analysis only.
 - Source mapping depends on debug info being present in or reachable from the binary.
-- The current radare2 integration covers sections, strings, imports, functions, xrefs/callers, and disassembly, but not yet graph views.
+- The current radare2 integration covers sections, strings, imports, functions, xrefs/callers, disassembly, and first-pass CFG views.

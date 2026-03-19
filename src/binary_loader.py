@@ -128,10 +128,23 @@ class _LibBfd:
         message = self._lib.bfd_errmsg(error_code)
         if not message:
             return f"libbfd error {error_code}"
-        return message.decode()
+        return message.decode(errors="replace")
 
 
-_LIBBFD = _LibBfd()
+_LIBBFD: _LibBfd | None = None
+
+
+def _libbfd() -> _LibBfd:
+    global _LIBBFD
+    if _LIBBFD is not None:
+        return _LIBBFD
+    try:
+        _LIBBFD = _LibBfd()
+    except BinaryLoaderError:
+        raise
+    except (AttributeError, OSError) as exc:
+        raise BinaryLoaderError(f"failed to initialize libbfd: {exc}") from exc
+    return _LIBBFD
 
 
 class BinaryLoader:
@@ -152,31 +165,34 @@ class BinaryLoader:
         if not self.path.is_file():
             raise BinaryLoaderError(f"binary not found: {self.path}")
 
-        handle = _LIBBFD._lib.bfd_openr(str(self.path).encode(), None)
+        libbfd = _libbfd()
+        handle = libbfd._lib.bfd_openr(str(self.path).encode(), None)
         if not handle:
-            raise BinaryLoaderError(f"failed to open {self.path}: {_LIBBFD.last_error()}")
-        if not _LIBBFD._lib.bfd_check_format(handle, _BFD_OBJECT):
-            _LIBBFD._lib.bfd_close(handle)
-            raise BinaryLoaderError(f"unsupported or invalid object format: {_LIBBFD.last_error()}")
+            raise BinaryLoaderError(f"failed to open {self.path}: {libbfd.last_error()}")
+        if not libbfd._lib.bfd_check_format(handle, _BFD_OBJECT):
+            libbfd._lib.bfd_close(handle)
+            raise BinaryLoaderError(f"unsupported or invalid object format: {libbfd.last_error()}")
 
         self._handle = handle
 
     def close(self) -> None:
         if self._handle is None:
             return
-        _LIBBFD._lib.bfd_close(self._handle)
+        _libbfd()._lib.bfd_close(self._handle)
         self._handle = None
 
     def image(self) -> BinaryImage:
         handle = self._require_open_handle()
+        libbfd = _libbfd()
         return BinaryImage(
             path=self.path,
-            arch_size=_LIBBFD._lib.bfd_get_arch_size(handle),
+            arch_size=libbfd._lib.bfd_get_arch_size(handle),
             sections=tuple(self.sections()),
         )
 
     def sections(self) -> list[SectionInfo]:
         handle = self._require_open_handle()
+        libbfd = _libbfd()
         sections: list[SectionInfo] = []
 
         @_SECTION_CALLBACK
@@ -184,7 +200,7 @@ class BinaryLoader:
             raw = section.contents
             out.append(
                 SectionInfo(
-                    name=raw.name.decode(),
+                    name=(raw.name or b"").decode(errors="replace"),
                     index=raw.index,
                     size=int(raw.size),
                     vma=int(raw.vma),
@@ -195,12 +211,13 @@ class BinaryLoader:
                 )
             )
 
-        _LIBBFD._lib.bfd_map_over_sections(handle, collect, sections)
+        libbfd._lib.bfd_map_over_sections(handle, collect, sections)
         return sections
 
     def read_section(self, name: str) -> bytes:
         handle = self._require_open_handle()
-        section = _LIBBFD._lib.bfd_get_section_by_name(handle, name.encode())
+        libbfd = _libbfd()
+        section = libbfd._lib.bfd_get_section_by_name(handle, name.encode())
         if not section:
             raise BinaryLoaderError(f"section not found: {name}")
 
@@ -209,9 +226,9 @@ class BinaryLoader:
             return b""
 
         buffer = (ctypes.c_ubyte * size)()
-        ok = _LIBBFD._lib.bfd_get_section_contents(handle, section, buffer, 0, size)
+        ok = libbfd._lib.bfd_get_section_contents(handle, section, buffer, 0, size)
         if not ok:
-            raise BinaryLoaderError(f"failed to read section {name}: {_LIBBFD.last_error()}")
+            raise BinaryLoaderError(f"failed to read section {name}: {libbfd.last_error()}")
         return bytes(buffer)
 
     def _require_open_handle(self) -> int:

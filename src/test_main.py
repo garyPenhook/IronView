@@ -1,14 +1,20 @@
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 from PySide6.QtWidgets import QApplication
 
+import src.binary_loader
+import src.gnu_toolchain
 from src.binary_loader import BinaryLoader, BinaryLoaderError
 from src.disassembler import (
+    ControlFlowBlock,
+    ControlFlowEdge,
     DisassembledInstruction,
     DisassemblyResult,
     FunctionDisassemblyResult,
+    FunctionGraphResult,
     FunctionInfo,
     ImportInfo,
     InstructionTarget,
@@ -19,8 +25,16 @@ from src.disassembler import (
     format_function_disassembly,
     format_function_disassembly_html,
 )
-from src.gnu_toolchain import GnuToolchain, SymbolInfo
-from src.gui import DARK_THEME, LIGHT_THEME, MainWindow, _build_export_path, _matches_section_filter
+from src.gnu_toolchain import GnuToolchain, GnuToolchainError, SymbolInfo
+from src.gui import (
+    DARK_THEME,
+    ErrorInfo,
+    LIGHT_THEME,
+    MainWindow,
+    _build_export_path,
+    _find_cfg_block_address,
+    _matches_section_filter,
+)
 from src.main import main
 
 
@@ -68,6 +82,18 @@ def test_loader_raises_for_missing_section(sample_binary: Path) -> None:
     with BinaryLoader(sample_binary) as loader:
         with pytest.raises(BinaryLoaderError, match="section not found"):
             loader.read_section(".definitely_missing")
+
+
+def test_loader_wraps_libbfd_initialization_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    class BrokenLibBfd:
+        def __init__(self) -> None:
+            raise OSError("missing libbfd dependency")
+
+    monkeypatch.setattr(src.binary_loader, "_LIBBFD", None)
+    monkeypatch.setattr(src.binary_loader, "_LibBfd", BrokenLibBfd)
+
+    with pytest.raises(BinaryLoaderError, match="failed to initialize libbfd: missing libbfd dependency"):
+        src.binary_loader._libbfd()
 
 
 def test_main_launches_gui_when_no_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -223,6 +249,34 @@ def test_gnu_toolchain_demangles_cxx_symbol() -> None:
     assert toolchain.demangle("_ZNSt8ios_base4InitC1Ev") == "std::ios_base::Init::Init()"
 
 
+def test_gnu_toolchain_reports_partial_nm_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    toolchain = GnuToolchain("/bin/ls")
+    monkeypatch.setattr(
+        src.gnu_toolchain.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=["nm"],
+            returncode=1,
+            stdout="main T 0000000000401000 10\n",
+            stderr="file format not recognized",
+        ),
+    )
+
+    with pytest.raises(GnuToolchainError, match="nm produced partial output: file format not recognized"):
+        toolchain._run_nm(is_dynamic=False)
+
+
+def test_find_cfg_block_address_matches_inner_address() -> None:
+    blocks = (
+        ControlFlowBlock(0x401000, 0x10, ()),
+        ControlFlowBlock(0x401010, 0x20, ()),
+    )
+
+    assert _find_cfg_block_address(blocks, 0x401000) == 0x401000
+    assert _find_cfg_block_address(blocks, 0x40101A) == 0x401010
+    assert _find_cfg_block_address(blocks, 0x402000) is None
+
+
 def test_radare2_lists_strings_and_xrefs(
     has_radare2: bool,
     sample_binary: Path,
@@ -255,6 +309,23 @@ def test_radare2_lists_imports_and_callers(
     assert imports
     assert xrefs
     assert any(xref.function_name == "main" for xref in xrefs)
+
+
+def test_radare2_builds_function_cfg(
+    has_radare2: bool,
+    sample_binary: Path,
+) -> None:
+    if not has_radare2:
+        pytest.skip("radare2 is not installed")
+
+    with Radare2Disassembler(sample_binary) as disassembler:
+        functions = disassembler.list_functions()
+        main_function = next(function for function in functions if function.name == "main")
+        graph = disassembler.analyze_function_graph(main_function)
+
+    assert graph.blocks
+    assert any(block.address == main_function.address for block in graph.blocks)
+    assert graph.edges
 
 
 def test_main_window_theme_toggle_and_filtering(qt_app: QApplication, sample_binary: Path) -> None:
@@ -322,6 +393,46 @@ def test_main_window_select_function_by_inner_address(qt_app: QApplication) -> N
     window.close()
 
 
+def test_main_window_renders_function_cfg(qt_app: QApplication) -> None:
+    window = MainWindow()
+    function = FunctionInfo("main", 0x401000, 0x30, 3, "sym", "int main(void);")
+    graph = FunctionGraphResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        blocks=(
+            ControlFlowBlock(
+                0x401000,
+                0x10,
+                (
+                    DisassembledInstruction(0x401000, 2, "75 0A", "jne 0x40100c"),
+                    DisassembledInstruction(0x401002, 2, "90", "nop"),
+                ),
+            ),
+            ControlFlowBlock(
+                0x401010,
+                0x10,
+                (
+                    DisassembledInstruction(0x401010, 1, "C3", "ret"),
+                ),
+            ),
+        ),
+        edges=(
+            ControlFlowEdge(0x401000, 0x401010, "jump"),
+        ),
+    )
+
+    window._render_function_graph(graph)
+    window._highlight_cfg_block(0x401010)
+    qt_app.processEvents()
+
+    assert len(window._cfg_block_items) == 2
+    assert window._selected_cfg_block_address == 0x401010
+    assert not window.function_cfg_scene.itemsBoundingRect().isNull()
+    window.close()
+
+
 def test_main_window_string_filtering(qt_app: QApplication) -> None:
     window = MainWindow()
     window._populate_strings_table(
@@ -386,6 +497,35 @@ def test_main_window_symbol_filtering(qt_app: QApplication) -> None:
     window.close()
 
 
+def test_main_window_export_handles_filesystem_errors(
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow()
+    window._current_path = Path("/bin/ls")
+    window._selected_section = ".text"
+    window._selected_section_bytes = b"\x90\xC3"
+    errors: list[tuple[str, str]] = []
+
+    monkeypatch.setattr("src.gui.QFileDialog.getSaveFileName", lambda *args: ("/root/forbidden.bin", ""))
+    monkeypatch.setattr(
+        "src.gui.QMessageBox.critical",
+        lambda _parent, title, message: errors.append((title, message)),
+    )
+    monkeypatch.setattr(
+        Path,
+        "write_bytes",
+        lambda self, data: (_ for _ in ()).throw(PermissionError("permission denied")),
+    )
+
+    window.export_selected_section()
+    qt_app.processEvents()
+
+    assert errors == [("Export Error", "failed to export .text to /root/forbidden.bin: permission denied")]
+    assert "failed to export .text to /root/forbidden.bin: permission denied" in window.console.toPlainText()
+    window.close()
+
+
 def test_main_window_console_logs_messages(qt_app: QApplication) -> None:
     window = MainWindow()
     window._log_message("test message")
@@ -432,3 +572,34 @@ def test_main_window_launch_gdb_terminal_logs_launch(
 
     assert "Launched gdb for ls in external terminal" in window.console.toPlainText()
     window.close()
+
+
+def test_main_window_show_error_uses_error_title(
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow()
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "src.gui.QMessageBox.critical",
+        lambda _parent, title, message: errors.append((title, message)),
+    )
+
+    window._show_error(ErrorInfo(title="GNU Toolchain Error", message="nm failed"))
+    qt_app.processEvents()
+
+    assert errors == [("GNU Toolchain Error", "nm failed")]
+    window.close()
+
+
+def test_radare2_close_suppresses_quit_failures() -> None:
+    class BrokenR2:
+        def quit(self) -> None:
+            raise RuntimeError("broken pipe")
+
+    disassembler = Radare2Disassembler("/bin/ls")
+    disassembler._r2 = BrokenR2()
+
+    disassembler.close()
+
+    assert disassembler._r2 is None

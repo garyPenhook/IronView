@@ -61,6 +61,30 @@ class FunctionDisassemblyResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ControlFlowBlock:
+    address: int
+    size: int
+    instructions: tuple[DisassembledInstruction, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ControlFlowEdge:
+    source_address: int
+    target_address: int
+    kind: str
+
+
+@dataclass(frozen=True, slots=True)
+class FunctionGraphResult:
+    path: Path
+    function: FunctionInfo
+    architecture: str
+    bits: int
+    blocks: tuple[ControlFlowBlock, ...]
+    edges: tuple[ControlFlowEdge, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class StringInfo:
     value: str
     address: int
@@ -241,6 +265,50 @@ def _normalize_function(raw_function: dict[str, Any]) -> FunctionInfo | None:
     )
 
 
+def _normalize_block(raw_block: dict[str, Any]) -> ControlFlowBlock | None:
+    address = raw_block.get("addr")
+    if not isinstance(address, int):
+        return None
+    size = raw_block.get("size")
+    raw_instructions = raw_block.get("ops")
+    if not isinstance(raw_instructions, list):
+        raw_instructions = []
+    instructions = tuple(
+        instruction
+        for item in raw_instructions
+        if (instruction := _normalize_instruction(item)) is not None
+    )
+    return ControlFlowBlock(
+        address=address,
+        size=size if isinstance(size, int) else 0,
+        instructions=instructions,
+    )
+
+
+def _normalize_block_edges(raw_block: dict[str, Any]) -> tuple[ControlFlowEdge, ...]:
+    source_address = raw_block.get("addr")
+    if not isinstance(source_address, int):
+        return ()
+    edges: list[ControlFlowEdge] = []
+    seen: set[tuple[int, int, str]] = set()
+    for key in ("jump", "fail"):
+        target_address = raw_block.get(key)
+        if not isinstance(target_address, int) or target_address <= 0:
+            continue
+        edge = (source_address, target_address, key)
+        if edge in seen:
+            continue
+        seen.add(edge)
+        edges.append(
+            ControlFlowEdge(
+                source_address=source_address,
+                target_address=target_address,
+                kind=key,
+            )
+        )
+    return tuple(edges)
+
+
 def _normalize_string(raw_string: dict[str, Any]) -> StringInfo | None:
     value = raw_string.get("string")
     address = raw_string.get("vaddr")
@@ -340,8 +408,12 @@ class Radare2Disassembler:
     def close(self) -> None:
         if self._r2 is None:
             return
-        self._r2.quit()
+        r2 = self._r2
         self._r2 = None
+        try:
+            r2.quit()
+        except Exception:
+            return
 
     def disassemble_section(
         self,
@@ -479,6 +551,51 @@ class Radare2Disassembler:
             architecture=self._architecture,
             bits=self._bits,
             instructions=instructions,
+        )
+
+    def analyze_function_graph(
+        self,
+        function: FunctionInfo,
+    ) -> FunctionGraphResult:
+        r2 = self._require_open()
+        try:
+            raw_graphs = r2.cmdj(f"agfj @ {function.address}") or []
+        except Exception as exc:
+            raise Radare2DisassemblerError(
+                f"failed to analyze control flow for {function.name} at {_format_hex(function.address)}: {exc}"
+            ) from exc
+        if not isinstance(raw_graphs, list) or not raw_graphs:
+            raise Radare2DisassemblerError(f"radare2 returned no graph data for {function.name}")
+        raw_graph = raw_graphs[0]
+        if not isinstance(raw_graph, dict):
+            raise Radare2DisassemblerError("radare2 returned malformed function graph data")
+        raw_blocks = raw_graph.get("blocks")
+        if not isinstance(raw_blocks, list):
+            raise Radare2DisassemblerError("radare2 returned malformed function blocks")
+        blocks = tuple(
+            block
+            for item in raw_blocks
+            if (block := _normalize_block(item)) is not None
+        )
+        if not blocks:
+            raise Radare2DisassemblerError(f"radare2 returned no blocks for {function.name}")
+        edges = tuple(
+            sorted(
+                (
+                    edge
+                    for item in raw_blocks
+                    for edge in _normalize_block_edges(item)
+                ),
+                key=lambda edge: (edge.source_address, edge.target_address, edge.kind),
+            )
+        )
+        return FunctionGraphResult(
+            path=self.path,
+            function=function,
+            architecture=self._architecture,
+            bits=self._bits,
+            blocks=tuple(sorted(blocks, key=lambda block: block.address)),
+            edges=edges,
         )
 
     def _disassemble_at(

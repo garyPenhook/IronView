@@ -15,7 +15,7 @@ The CLI and GUI share the same binary inspection primitives.
 
 ## Module Layout
 
-### [`src/main.py`](/home/gary/PycharmProjects/new_app/src/main.py)
+### [`src/main.py`](/home/gary/PycharmProjects/IronView/src/main.py)
 
 Entry point for both CLI and GUI usage.
 
@@ -26,7 +26,7 @@ Responsibilities:
 - print section metadata in JSON form for CLI usage
 - dump a section as hex in CLI mode
 
-### [`src/binary_loader.py`](/home/gary/PycharmProjects/new_app/src/binary_loader.py)
+### [`src/binary_loader.py`](/home/gary/PycharmProjects/IronView/src/binary_loader.py)
 
 `libbfd` wrapper implemented with `ctypes`.
 
@@ -45,7 +45,7 @@ Primary public types:
 - `SectionInfo`
 - `BinaryLoaderError`
 
-### [`src/disassembler.py`](/home/gary/PycharmProjects/new_app/src/disassembler.py)
+### [`src/disassembler.py`](/home/gary/PycharmProjects/IronView/src/disassembler.py)
 
 Read-only `radare2` integration through `r2pipe`.
 
@@ -59,6 +59,7 @@ Responsibilities:
 - enumerate imports with `iij`
 - enumerate xrefs with `axtj`
 - return full function disassembly with `pdfj`
+- return function CFGs with `agfj`
 
 Primary public types:
 
@@ -76,7 +77,7 @@ Current radare2 open flags:
 
 These are intended to keep sessions predictable, quiet, and read-only.
 
-### [`src/gnu_toolchain.py`](/home/gary/PycharmProjects/new_app/src/gnu_toolchain.py)
+### [`src/gnu_toolchain.py`](/home/gary/PycharmProjects/IronView/src/gnu_toolchain.py)
 
 GNU toolchain wrapper implemented with `subprocess`.
 
@@ -88,7 +89,7 @@ Responsibilities:
 - capture ELF structure reports with `readelf`
 - expose a small typed interface to the GUI
 
-### [`src/gui.py`](/home/gary/PycharmProjects/new_app/src/gui.py)
+### [`src/gui.py`](/home/gary/PycharmProjects/IronView/src/gui.py)
 
 Qt desktop application built with `PySide6`.
 
@@ -153,6 +154,7 @@ Function inspector:
 - metadata form
 - GNU demangled/source fields
 - full function disassembly preview
+- CFG tab with clickable basic blocks
 - clickable target links that navigate within the current function or into another loaded function
 
 String inspector:
@@ -188,6 +190,7 @@ Current worker types:
 - `DisassemblyLoadWorker`
 - `FunctionListWorker`
 - `FunctionDisassemblyWorker`
+- `FunctionGraphWorker`
 - `StringListWorker`
 - `XrefLoadWorker`
 - `ImportListWorker`
@@ -220,8 +223,8 @@ Why this matters:
 1. After image load, radare2 function enumeration starts.
 2. `aflj` results populate the function table.
 3. User selects a function.
-4. `pdfj @ <addr>` runs in the background.
-5. The function inspector updates with metadata and formatted disassembly.
+4. `pdfj @ <addr>` and `agfj @ <addr>` run in the background.
+5. The function inspector updates with metadata, formatted disassembly, and a clickable control-flow graph.
 
 ### String Flow
 
@@ -263,7 +266,7 @@ Current strategy:
 
 ## Tests
 
-Current test coverage in [`src/test_main.py`](/home/gary/PycharmProjects/new_app/src/test_main.py) covers:
+Current test coverage in [`src/test_main.py`](/home/gary/PycharmProjects/IronView/src/test_main.py) covers:
 
 - section listing
 - section reads
@@ -273,6 +276,7 @@ Current test coverage in [`src/test_main.py`](/home/gary/PycharmProjects/new_app
 - export path generation
 - radare2 section disassembly
 - radare2 function listing and function disassembly
+- radare2 function CFG loading
 - radare2 string listing and xrefs
 - radare2 import listing and callers
 - GNU symbol listing
@@ -287,7 +291,6 @@ Current test coverage in [`src/test_main.py`](/home/gary/PycharmProjects/new_app
 
 Not implemented yet:
 
-- function graph / CFG view
 - symbol rename/comment persistence
 - patching or write-mode analysis
 
