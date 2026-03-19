@@ -13,6 +13,7 @@ from src.disassembler import (
     ControlFlowEdge,
     DisassembledInstruction,
     DisassemblyResult,
+    FunctionDecompilationResult,
     FunctionDisassemblyResult,
     FunctionGraphResult,
     FunctionInfo,
@@ -30,6 +31,7 @@ from src.gui import (
     DARK_THEME,
     ErrorInfo,
     LIGHT_THEME,
+    LoadedFunctionDecompilation,
     MainWindow,
     _build_export_path,
     _find_cfg_block_address,
@@ -172,6 +174,24 @@ def test_radare2_lists_functions_and_renders_function_disassembly(
     rendered = format_function_disassembly(result)
     assert "entry0" in rendered
     assert "instructions" in rendered
+
+
+def test_radare2_decompile_function_returns_hll_text() -> None:
+    class FakeR2:
+        def cmd(self, command: str) -> str:
+            assert command == "pdc @ 4198400"
+            return "int main(void) {\n    return 0;\n}\n"
+
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
+    disassembler = Radare2Disassembler("/bin/ls")
+    disassembler._r2 = FakeR2()
+    disassembler._architecture = "x86"
+    disassembler._bits = 64
+
+    result = disassembler.decompile_function(function)
+
+    assert result.backend == "pdc"
+    assert "return 0;" in result.text
 
 
 def test_disassembly_html_renders_navigation_links() -> None:
@@ -430,6 +450,34 @@ def test_main_window_renders_function_cfg(qt_app: QApplication) -> None:
     assert len(window._cfg_block_items) == 2
     assert window._selected_cfg_block_address == 0x401010
     assert not window.function_cfg_scene.itemsBoundingRect().isNull()
+    window.close()
+
+
+def test_main_window_loads_function_decompilation(qt_app: QApplication) -> None:
+    window = MainWindow()
+    function = FunctionInfo("main", 0x401000, 0x30, 3, "sym", "int main(void);")
+    result = FunctionDecompilationResult(
+        path=Path("/bin/ls"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdc",
+        text="int main(void) {\n    return 0;\n}",
+    )
+    window._current_path = Path("/bin/ls")
+    window._selected_function_address = function.address
+
+    window._on_function_decompilation_loaded(
+        LoadedFunctionDecompilation(
+            path=Path("/bin/ls"),
+            function_address=function.address,
+            result=result,
+        )
+    )
+    qt_app.processEvents()
+
+    assert "pdc HLL-style decompilation" in window.function_decompilation_summary.text()
+    assert "return 0;" in window.function_decompilation_preview.toPlainText()
     window.close()
 
 

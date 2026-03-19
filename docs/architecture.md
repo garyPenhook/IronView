@@ -154,6 +154,7 @@ Function inspector:
 - metadata form
 - GNU demangled/source fields
 - full function disassembly preview
+- HLL-style decompilation tab backed by radare2 `pdc`
 - CFG tab with clickable basic blocks
 - clickable target links that navigate within the current function or into another loaded function
 
@@ -190,6 +191,7 @@ Current worker types:
 - `DisassemblyLoadWorker`
 - `FunctionListWorker`
 - `FunctionDisassemblyWorker`
+- `FunctionDecompilationWorker`
 - `FunctionGraphWorker`
 - `StringListWorker`
 - `XrefLoadWorker`
@@ -223,8 +225,8 @@ Why this matters:
 1. After image load, radare2 function enumeration starts.
 2. `aflj` results populate the function table.
 3. User selects a function.
-4. `pdfj @ <addr>` and `agfj @ <addr>` run in the background.
-5. The function inspector updates with metadata, formatted disassembly, and a clickable control-flow graph.
+4. `pdfj @ <addr>`, `pdc @ <addr>`, and `agfj @ <addr>` run in the background.
+5. The function inspector updates with metadata, formatted disassembly, an HLL-style view, and a clickable control-flow graph.
 
 ### String Flow
 
@@ -276,6 +278,7 @@ Current test coverage in [`src/test_main.py`](/home/gary/PycharmProjects/IronVie
 - export path generation
 - radare2 section disassembly
 - radare2 function listing and function disassembly
+- radare2 function decompilation
 - radare2 function CFG loading
 - radare2 string listing and xrefs
 - radare2 import listing and callers

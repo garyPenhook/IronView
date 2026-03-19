@@ -27,6 +27,7 @@ The project supports both GUI and CLI workflows.
 - Filter imports by name, PLT address, bind, or type
 - Filter symbols by raw name, demangled name, address, or type
 - Preview full function disassembly for a selected function
+- Preview a function-level HLL-style view through radare2 `pdc`
 - Click jump and call targets directly from section and function disassembly
 - Inspect xrefs to selected strings and jump from xrefs into functions
 - Inspect callers of imported functions and jump from callers into functions
@@ -103,12 +104,13 @@ uv run python -m src.main /bin/ls --section .text
 7. Select a string to load xrefs, then double-click an xref row to jump to the referenced function when available.
 8. Select an import to load callers, then double-click a caller row to jump to the referenced function when available.
 9. Select a function or symbol to load GNU demangling and source-location metadata.
-10. Use the `CFG` sub-tab inside the function inspector to review basic blocks and click a block to jump into disassembly.
-11. Use the `ELF` tab to inspect the current binary through `readelf`.
-12. Use the bottom `System Console` to watch loads, exports, errors, and analysis activity.
-13. Enter Linux commands in the console input and run them in the project directory.
-14. Use `Run Codex` to launch `codex` in an external terminal with a real TTY.
-15. Use `Run GDB` to launch `gdb` for the current binary in an external terminal.
+10. Use the `HLL` sub-tab inside the function inspector to review radare2 `pdc` decompilation.
+11. Use the `CFG` sub-tab inside the function inspector to review basic blocks and click a block to jump into disassembly.
+12. Use the `ELF` tab to inspect the current binary through `readelf`.
+13. Use the bottom `System Console` to watch loads, exports, errors, and analysis activity.
+14. Enter Linux commands in the console input and run them in the project directory.
+15. Use `Run Codex` to launch `codex` in an external terminal with a real TTY.
+16. Use `Run GDB` to launch `gdb` for the current binary in an external terminal.
 
 ## CLI Behavior
 

@@ -56,6 +56,7 @@ from src.disassembler import (
     ControlFlowEdge,
     DEFAULT_INSTRUCTION_LIMIT,
     DisassemblyResult,
+    FunctionDecompilationResult,
     FunctionDisassemblyResult,
     FunctionGraphResult,
     FunctionInfo,
@@ -359,6 +360,14 @@ class LoadedFunctionDisassembly:
 
 
 @dataclass(frozen=True, slots=True)
+class LoadedFunctionDecompilation:
+    path: Path
+    function_address: int
+    result: FunctionDecompilationResult | None
+    message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class LoadedFunctionGraph:
     path: Path
     function_address: int
@@ -427,6 +436,7 @@ class WorkerSignals(QObject):
     loaded_disassembly = Signal(object)
     loaded_functions = Signal(object)
     loaded_function_disassembly = Signal(object)
+    loaded_function_decompilation = Signal(object)
     loaded_function_graph = Signal(object)
     loaded_strings = Signal(object)
     loaded_xrefs = Signal(object)
@@ -590,6 +600,38 @@ class FunctionDisassemblyWorker(QRunnable):
         _safe_emit(
             self.signals.loaded_function_disassembly,
             LoadedFunctionDisassembly(
+                path=self.path,
+                function_address=self.function.address,
+                result=result,
+            ),
+        )
+
+
+class FunctionDecompilationWorker(QRunnable):
+    def __init__(self, path: Path, function: FunctionInfo, signals: WorkerSignals) -> None:
+        super().__init__()
+        self.path = path
+        self.function = function
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            with Radare2Disassembler(self.path) as disassembler:
+                result = disassembler.decompile_function(self.function)
+        except Radare2DisassemblerError as exc:
+            _safe_emit(
+                self.signals.loaded_function_decompilation,
+                LoadedFunctionDecompilation(
+                    path=self.path,
+                    function_address=self.function.address,
+                    result=None,
+                    message=str(exc),
+                ),
+            )
+            return
+        _safe_emit(
+            self.signals.loaded_function_decompilation,
+            LoadedFunctionDecompilation(
                 path=self.path,
                 function_address=self.function.address,
                 result=result,
@@ -772,6 +814,7 @@ class MainWindow(QMainWindow):
         self._signals.loaded_disassembly.connect(self._on_disassembly_loaded)
         self._signals.loaded_functions.connect(self._on_functions_loaded)
         self._signals.loaded_function_disassembly.connect(self._on_function_disassembly_loaded)
+        self._signals.loaded_function_decompilation.connect(self._on_function_decompilation_loaded)
         self._signals.loaded_function_graph.connect(self._on_function_graph_loaded)
         self._signals.loaded_strings.connect(self._on_strings_loaded)
         self._signals.loaded_xrefs.connect(self._on_xrefs_loaded)
@@ -790,6 +833,7 @@ class MainWindow(QMainWindow):
         self._readelf_report: str = ""
         self._current_section_disassembly: DisassemblyResult | None = None
         self._current_function_disassembly: FunctionDisassemblyResult | None = None
+        self._current_function_decompilation: FunctionDecompilationResult | None = None
         self._current_function_graph: FunctionGraphResult | None = None
         self._pending_function_scroll_address: int | None = None
         self._selected_section: str | None = None
@@ -1350,12 +1394,30 @@ class MainWindow(QMainWindow):
             "Select a function from the radare2 browser to preview its disassembly."
         )
 
+        self.function_decompilation_summary = QLabel(
+            "Select a radare2 function to preview its HLL-style decompilation."
+        )
+        self.function_decompilation_summary.setProperty("role", "muted")
+        self.function_decompilation_preview = QPlainTextEdit(parent)
+        self.function_decompilation_preview.setReadOnly(True)
+        self.function_decompilation_preview.setFont(fixed_font)
+        self.function_decompilation_preview.setPlaceholderText(
+            "Select a function from the radare2 browser to preview its decompilation."
+        )
+
         disassembly_tab = QWidget(parent)
         disassembly_layout = QVBoxLayout(disassembly_tab)
         disassembly_layout.setContentsMargins(0, 0, 0, 0)
         disassembly_layout.setSpacing(8)
         disassembly_layout.addWidget(self.function_disassembly_summary)
         disassembly_layout.addWidget(self.function_disassembly_preview, stretch=1)
+
+        decompilation_tab = QWidget(parent)
+        decompilation_layout = QVBoxLayout(decompilation_tab)
+        decompilation_layout.setContentsMargins(0, 0, 0, 0)
+        decompilation_layout.setSpacing(8)
+        decompilation_layout.addWidget(self.function_decompilation_summary)
+        decompilation_layout.addWidget(self.function_decompilation_preview, stretch=1)
 
         self.function_cfg_summary = QLabel("Select a radare2 function to preview its control-flow graph.")
         self.function_cfg_summary.setProperty("role", "muted")
@@ -1374,6 +1436,7 @@ class MainWindow(QMainWindow):
 
         self.function_preview_tabs = QTabWidget(parent)
         self.function_preview_tabs.addTab(disassembly_tab, "Disassembly")
+        self.function_preview_tabs.addTab(decompilation_tab, "HLL")
         self.function_preview_tabs.addTab(cfg_tab, "CFG")
 
         layout.addLayout(detail_form)
@@ -1561,6 +1624,7 @@ class MainWindow(QMainWindow):
         self._readelf_report = ""
         self._current_section_disassembly = None
         self._current_function_disassembly = None
+        self._current_function_decompilation = None
         self._current_function_graph = None
         self._pending_function_scroll_address = None
         self._selected_section = None
@@ -1673,6 +1737,23 @@ class MainWindow(QMainWindow):
             self._scroll_function_disassembly_to_address(self._pending_function_scroll_address)
             self._pending_function_scroll_address = None
         self._set_status(f"Loaded function disassembly for {function.name}", 4000)
+
+    def _on_function_decompilation_loaded(self, loaded: LoadedFunctionDecompilation) -> None:
+        if self._current_path != loaded.path or self._selected_function_address != loaded.function_address:
+            return
+        if loaded.result is None:
+            self._current_function_decompilation = None
+            self.function_decompilation_summary.setText(loaded.message)
+            self.function_decompilation_preview.setPlainText("")
+            self._set_status(loaded.message, 4000)
+            return
+        function = loaded.result.function
+        self._current_function_decompilation = loaded.result
+        self.function_decompilation_summary.setText(
+            f"{loaded.result.backend} HLL-style decompilation for {function.name} at {_format_hex(function.address)}."
+        )
+        self.function_decompilation_preview.setPlainText(loaded.result.text)
+        self._set_status(f"Loaded HLL view for {function.name}", 4000)
 
     def _on_function_graph_loaded(self, loaded: LoadedFunctionGraph) -> None:
         if self._current_path != loaded.path or self._selected_function_address != loaded.function_address:
@@ -2047,12 +2128,15 @@ class MainWindow(QMainWindow):
         if not isinstance(function, FunctionInfo):
             return
         self._selected_function_address = function.address
+        self._current_function_decompilation = None
         self._current_function_graph = None
         self.details_tabs.setCurrentIndex(1)
         self._update_function_details(function)
         self.function_preview_tabs.setCurrentIndex(0)
         self.function_disassembly_summary.setText("Loading function disassembly from radare2...")
         self.function_disassembly_preview.setPlainText("Loading function disassembly...")
+        self.function_decompilation_summary.setText("Loading HLL-style decompilation from radare2...")
+        self.function_decompilation_preview.setPlainText("Loading decompilation...")
         self.function_cfg_summary.setText("Loading control-flow graph from radare2...")
         self.function_cfg_scene.clear()
         self._cfg_block_items.clear()
@@ -2061,6 +2145,7 @@ class MainWindow(QMainWindow):
         self.function_source_value.setText("Loading source lookup...")
         self._set_status(f"Reading {function.name}...")
         self._thread_pool.start(FunctionDisassemblyWorker(self._current_path, function, self._signals))
+        self._thread_pool.start(FunctionDecompilationWorker(self._current_path, function, self._signals))
         self._thread_pool.start(FunctionGraphWorker(self._current_path, function, self._signals))
         self._thread_pool.start(
             AddressMetadataWorker(
@@ -2382,6 +2467,7 @@ class MainWindow(QMainWindow):
 
     def _clear_function_details(self) -> None:
         self._current_function_disassembly = None
+        self._current_function_decompilation = None
         self._current_function_graph = None
         self._pending_function_scroll_address = None
         self._selected_cfg_block_address = None
@@ -2398,6 +2484,10 @@ class MainWindow(QMainWindow):
             "Select a radare2 function to preview its full disassembly."
         )
         self.function_disassembly_preview.setPlainText("")
+        self.function_decompilation_summary.setText(
+            "Select a radare2 function to preview its HLL-style decompilation."
+        )
+        self.function_decompilation_preview.setPlainText("")
         self.function_cfg_summary.setText("Select a radare2 function to preview its control-flow graph.")
         self.function_cfg_scene.clear()
 

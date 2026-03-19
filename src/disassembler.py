@@ -61,6 +61,16 @@ class FunctionDisassemblyResult:
 
 
 @dataclass(frozen=True, slots=True)
+class FunctionDecompilationResult:
+    path: Path
+    function: FunctionInfo
+    architecture: str
+    bits: int
+    backend: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class ControlFlowBlock:
     address: int
     size: int
@@ -551,6 +561,29 @@ class Radare2Disassembler:
             architecture=self._architecture,
             bits=self._bits,
             instructions=instructions,
+        )
+
+    def decompile_function(
+        self,
+        function: FunctionInfo,
+    ) -> FunctionDecompilationResult:
+        r2 = self._require_open()
+        try:
+            output = r2.cmd(f"pdc @ {function.address}")
+        except Exception as exc:
+            raise Radare2DisassemblerError(
+                f"failed to decompile function {function.name} at {_format_hex(function.address)}: {exc}"
+            ) from exc
+        text = output.strip() if isinstance(output, str) else ""
+        if not text:
+            raise Radare2DisassemblerError(f"radare2 returned no decompilation for {function.name}")
+        return FunctionDecompilationResult(
+            path=self.path,
+            function=function,
+            architecture=self._architecture,
+            bits=self._bits,
+            backend="pdc",
+            text=text,
         )
 
     def analyze_function_graph(
