@@ -98,6 +98,21 @@ def test_loader_wraps_libbfd_initialization_errors(monkeypatch: pytest.MonkeyPat
         src.binary_loader._libbfd()
 
 
+def test_resolve_library_skips_missing_hardcoded_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(src.binary_loader.ctypes.util, "find_library", lambda name: None)
+    monkeypatch.setattr(
+        src.binary_loader.Path,
+        "glob",
+        lambda self, pattern: [Path("/usr/lib/x86_64-linux-gnu/libbfd-2.46-system.so")]
+        if str(self) == "/usr/lib" and pattern == "*/libbfd-*.so"
+        else [],
+    )
+
+    resolved = src.binary_loader._LibBfd._resolve_library()
+
+    assert resolved == "/usr/lib/x86_64-linux-gnu/libbfd-2.46-system.so"
+
+
 def test_main_launches_gui_when_no_path(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str | None] = []
 

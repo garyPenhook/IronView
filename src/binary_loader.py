@@ -87,14 +87,27 @@ class _LibBfd:
 
     @staticmethod
     def _resolve_library() -> str:
-        candidates = [
+        direct_candidates = [
             ctypes.util.find_library("bfd"),
-            "/usr/lib/x86_64-linux-gnu/libbfd-2.46-system.so",
             "/usr/lib/x86_64-linux-gnu/libbfd.so",
         ]
-        for candidate in candidates:
-            if candidate:
+        for candidate in direct_candidates:
+            if not candidate:
+                continue
+            candidate_path = Path(candidate)
+            if not candidate_path.is_absolute() or candidate_path.exists():
                 return candidate
+        search_roots = (
+            Path("/usr/lib"),
+            Path("/lib"),
+        )
+        for root in search_roots:
+            if not root.exists():
+                continue
+            for pattern in ("*/libbfd-*.so", "*/libbfd.so", "libbfd-*.so", "libbfd.so"):
+                for match in sorted(root.glob(pattern)):
+                    if match.is_file():
+                        return str(match)
         raise BinaryLoaderError("libbfd shared library was not found on this system")
 
     def _configure(self) -> None:
