@@ -39,7 +39,7 @@ The project supports both GUI and CLI workflows.
 - Follow inline semantic HLL links for matched functions, imports, strings, and symbols when the rendered text is unambiguous
 - Review HLL call summaries and extracted argument/local declarations alongside the decompiled text
 - Prefer backend JSON for HLL calls and declarations when available, with text parsing as a fallback
-- Collapse common import-thunk, static-registration, fini-teardown, and stack-canary boilerplate in `Clean HLL` mode
+- Collapse common import-thunk, static-registration, fini-teardown, stack-canary, stack-probe, scoped-stack-object, and leading temp-declaration boilerplate in `Clean HLL` mode
 - Click jump and call targets directly from section and function disassembly
 - Inspect xrefs to selected strings and jump from xrefs into functions
 - Inspect callers of imported functions and jump from callers into functions
@@ -133,16 +133,17 @@ uv run python -m src.main /bin/ls --section .text
 14. Click correlated HLL line links to jump into function disassembly when address mappings are available.
 15. Use the HLL context table to jump into matched functions, imports, strings, and symbols referenced by the decompiled output.
 16. Click inline HLL semantic links to jump into matched functions, imports, strings, and symbols when available.
-17. Keep `Clean HLL` enabled for a shortened view that removes common radare2/plugin boilerplate such as import thunks, constructor registration, fini teardown, and stack-canary scaffolding.
+17. Keep `Clean HLL` enabled for a shortened view that removes common radare2/plugin boilerplate such as import thunks, constructor registration, fini teardown, stack-canary scaffolding, stack probes, and decompiler scratch-variable declaration walls.
 18. Use the HLL call summary and declarations view to review inferred callees, arguments, and locals.
 19. Use the `CFG` sub-tab inside the function inspector to review basic blocks and click a block to jump into disassembly.
 20. Use the `Binary` tab to inspect the current binary through a radare2-backed metadata report and linked-library view.
 21. Use the bottom `System Console` to watch loads, exports, errors, and analysis activity.
 22. Enter Linux commands in the console input and run them in the project directory.
 23. Use `View > Show Browser` and `View > Show Console` to reclaim space when focusing on HLL, disassembly, or CFG work.
-24. Use `Run Codex` to launch `codex` in an external terminal with a real TTY.
-25. Use `Run GDB` to launch `gdb` for the current binary in an external terminal.
-26. Use `Launch Ghidra` to open the external Ghidra GUI, or `Run Headless Analysis` in the `Binary` tab to collect a Ghidra report inside IronView.
+24. Use `View > Reset Layout` if a splitter gets dragged into an awkward state; the browser, inspector, HLL, and console panes all restore to their default proportions.
+25. Use `Run Codex` to launch `codex` in an external terminal with a real TTY.
+26. Use `Run GDB` to launch `gdb` for the current binary in an external terminal.
+27. Use `Launch Ghidra` to open the external Ghidra GUI, or `Run Headless Analysis` in the `Binary` tab to collect a Ghidra report inside IronView.
 
 ## CLI Behavior
 
@@ -191,4 +192,4 @@ python3 -m py_compile src/ghidra_toolchain.py src/gnu_toolchain.py src/disassemb
 - Source mapping depends on debug info being present in or reachable from the binary.
 - The current radare2 integration covers sections, strings, imports, exports, relocations, symbols, functions, xrefs/callers, disassembly, HLL-style output through `pdg`/`pdd`/`pdc` fallback, `Clean HLL` rendering heuristics, and first-pass CFG views.
 - The current Ghidra integration is intentionally shallow: external GUI launch plus on-demand headless report collection.
-- `Clean HLL` is a presentation layer. It improves readability, but it does not replace a real source-level decompiler or guarantee semantically correct rewrites.
+- `Clean HLL` is a presentation layer. It improves readability by collapsing decompiler scratch locals, thunk boilerplate, stack scaffolding, and similar noise, but it does not replace a real source-level decompiler or guarantee semantically correct rewrites.

@@ -60,7 +60,7 @@ STACK_CANARY_PTR_RETURN_PATTERN = re.compile(
 )
 STACK_FAIL_PATTERN = re.compile(r"^\s*import\.__stack_chk_fail\(\);\s*$")
 DECLARATION_NAME_PATTERN = re.compile(
-    r"^\s*(?:[A-Za-z_][A-Za-z0-9_:<>]*[\s\*\[\]]+)+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*;\s*$"
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_:<>]*[\s\*\[\]]+)+(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[[^\]]*\])*\s*;\s*$"
 )
 STACK_CANARY_RETURN_PATTERN = re.compile(
     r"^(?P<indent>\s*)if\s+\((?P<slot>[A-Za-z_][A-Za-z0-9_]*)\s*==\s*\*\(in_FS_OFFSET \+ 0x28\)\)\s*\{\s*$"
@@ -68,9 +68,13 @@ STACK_CANARY_RETURN_PATTERN = re.compile(
 RETURN_VALUE_PATTERN = re.compile(r"^(?P<indent>\s*)return\b.*;\s*$")
 TEMP_LOCAL_NAME_PATTERN = re.compile(
     r"^(?:"
-    r"(?:pc|ppc|pu|pi|pb|psz|ps|p|i|u|b|c|au|ai|f)d?Var\d+"
-    r"|(?:pc|u|i|ai|au|f|b)Stack_[0-9A-Fa-f]+"
-    r"|in_[A-Z0-9]+"
+    r"(?:[A-Za-z]{1,4}Var\d+)"
+    r"|(?:pc|ppc|pu|pi|pb|ppv|pv|apv|as|u|i|ai|au|f|b)Stack_[0-9A-Fa-f]+"
+    r"|[A-Za-z]\d+"
+    r"|in_[A-Za-z0-9_]+"
+    r"|unaff_[A-Za-z0-9_]+"
+    r"|extraout_[A-Za-z0-9_]+"
+    r"|n_\d+"
     r"|in_FS_OFFSET"
     r")$"
 )
@@ -95,6 +99,16 @@ STACK_PROBE_WHILE_PATTERN = re.compile(
 STACK_SLOT_MARKER_PATTERN = re.compile(
     r"^\s*\*\((?P<ptr>[A-Za-z_][A-Za-z0-9_]*) \+ [+-]?0x[0-9a-fA-F]+\)\s*=\s*0x[0-9a-fA-F]+;\s*$"
 )
+SCOPED_STACK_INIT_PATTERN = re.compile(
+    r"^(?P<indent>\s*)(?P<ctor>[A-Za-z_][A-Za-z0-9_.:]*)\((?P<obj>[A-Za-z_][A-Za-z0-9_]*)\);\s*$"
+)
+SCOPED_STACK_USE_ASSIGN_PATTERN = re.compile(
+    r"^(?P<indent>\s*)(?P<dest>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<callee>[A-Za-z_][A-Za-z0-9_.:]*)\((?P<args>[^)]*)\);\s*$"
+)
+SCOPED_STACK_DESTROY_PATTERN = re.compile(
+    r"^(?P<indent>\s*)(?P<dtor>[A-Za-z_][A-Za-z0-9_.:]*)\((?P<obj>[A-Za-z_][A-Za-z0-9_]*)\);\s*$"
+)
+RETURN_VAR_PATTERN = re.compile(r"^(?P<indent>\s*)return\s+(?P<value>[A-Za-z_][A-Za-z0-9_]*)\s*;\s*$")
 
 
 class Radare2DisassemblerError(RuntimeError):
@@ -337,6 +351,7 @@ def format_function_decompilation_html(
         rendered_lines = _collapse_fini_teardown_lines(rendered_lines)
         rendered_lines = _collapse_stack_probe_lines(rendered_lines)
         rendered_lines = _collapse_stack_canary_lines(rendered_lines)
+        rendered_lines = _collapse_scoped_stack_object_lines(rendered_lines)
         rendered_lines = _summarize_leading_declaration_block(rendered_lines)
         rendered_lines = _collapse_import_thunk_lines(result.function, rendered_lines)
     lines = []
@@ -575,6 +590,39 @@ def _collapse_stack_probe_lines(lines: Sequence[str]) -> tuple[str, ...]:
     return tuple(collapsed)
 
 
+def _collapse_scoped_stack_object_lines(lines: Sequence[str]) -> tuple[str, ...]:
+    collapsed: list[str] = []
+    index = 0
+    while index < len(lines):
+        if index + 3 < len(lines):
+            init_match = SCOPED_STACK_INIT_PATTERN.match(lines[index])
+            use_match = SCOPED_STACK_USE_ASSIGN_PATTERN.match(lines[index + 1])
+            destroy_match = SCOPED_STACK_DESTROY_PATTERN.match(lines[index + 2])
+            return_match = RETURN_VAR_PATTERN.match(lines[index + 3])
+            if (
+                init_match is not None
+                and use_match is not None
+                and destroy_match is not None
+                and return_match is not None
+                and init_match.group("obj") == destroy_match.group("obj")
+                and use_match.group("dest") == return_match.group("value")
+            ):
+                args = [part.strip() for part in use_match.group("args").split(",")]
+                if args and args[0] == init_match.group("obj"):
+                    joined_args = ",".join(args)
+                    indent = init_match.group("indent")
+                    object_name = init_match.group("obj")
+                    collapsed.append(
+                        f"{indent}/* scoped stack object {object_name} lifetime simplified */"
+                    )
+                    collapsed.append(f"{indent}return {use_match.group('callee')}({joined_args});")
+                    index += 4
+                    continue
+        collapsed.append(lines[index])
+        index += 1
+    return tuple(collapsed)
+
+
 def _collapse_temp_declaration_lines(lines: Sequence[str]) -> tuple[str, ...]:
     collapsed: list[str] = []
     omitted_temps = False
@@ -609,12 +657,17 @@ def _collapse_temp_declaration_lines(lines: Sequence[str]) -> tuple[str, ...]:
 
 
 def _summarize_leading_declaration_block(lines: Sequence[str]) -> tuple[str, ...]:
-    if len(lines) < 3 or lines[1].strip() != "{":
+    if len(lines) < 3:
         return tuple(lines)
-    preserved: list[str] = [lines[0], lines[1]]
+    brace_index = 1
+    while brace_index < len(lines) and not lines[brace_index].strip():
+        brace_index += 1
+    if brace_index >= len(lines) or lines[brace_index].strip() != "{":
+        return tuple(lines)
+    preserved: list[str] = list(lines[: brace_index + 1])
     kept_locals: list[str] = []
     omitted_count = 0
-    index = 2
+    index = brace_index + 1
     while index < len(lines):
         stripped = lines[index].strip()
         if stripped == "/* temporaries omitted */":

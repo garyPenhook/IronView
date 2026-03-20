@@ -83,6 +83,14 @@ from src.gnu_toolchain import GnuToolchain, GnuToolchainError, SourceLocation, S
 HEX_PREVIEW_LIMIT = 8192
 LIGHT_THEME = "light"
 DARK_THEME = "dark"
+SPLITTER_HANDLE_WIDTH = 12
+MIN_LEFT_PANE_WIDTH = 360
+MIN_RIGHT_PANE_WIDTH = 640
+MIN_BROWSER_HEIGHT = 220
+MIN_SECTION_HEIGHT = 260
+MIN_CONSOLE_HEIGHT = 160
+MIN_HLL_PREVIEW_HEIGHT = 240
+MIN_HLL_INSIGHTS_HEIGHT = 180
 SECTION_COLUMNS = (
     "Name",
     "Index",
@@ -779,6 +787,16 @@ def _terminal_command() -> str | None:
         if resolved is not None:
             return resolved
     return None
+
+
+def _configure_splitter(
+    splitter: QSplitter,
+    *,
+    collapsible: bool = False,
+    handle_width: int = SPLITTER_HANDLE_WIDTH,
+) -> None:
+    splitter.setHandleWidth(handle_width)
+    splitter.setChildrenCollapsible(collapsible)
 
 
 def _theme_stylesheet(theme: str) -> str:
@@ -1606,6 +1624,9 @@ class MainWindow(QMainWindow):
         self.toggle_console_action.setChecked(True)
         self.toggle_console_action.triggered.connect(self._toggle_console_pane)
 
+        self.reset_layout_action = QAction("Reset Layout", self)
+        self.reset_layout_action.triggered.connect(self.reset_layout)
+
         self.theme_action_group = QActionGroup(self)
         self.theme_action_group.setExclusive(True)
         self.theme_action_group.addAction(self.light_theme_action)
@@ -1625,6 +1646,8 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.exit_action)
 
         view_menu = self.menuBar().addMenu("View")
+        view_menu.addAction(self.reset_layout_action)
+        view_menu.addSeparator()
         view_menu.addAction(self.toggle_browser_action)
         view_menu.addAction(self.toggle_console_action)
         view_menu.addSeparator()
@@ -1645,6 +1668,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.run_gdb_action)
         toolbar.addAction(self.launch_ghidra_action)
         toolbar.addAction(self.run_ghidra_headless_action)
+        toolbar.addAction(self.reset_layout_action)
         self.addToolBar(toolbar)
 
     def _build_status_bar(self) -> None:
@@ -1700,21 +1724,29 @@ class MainWindow(QMainWindow):
 
         self.sections_group = self._build_sections_group()
         self.browser_group = self._build_browser_group()
+        self.sections_group.setMinimumHeight(MIN_SECTION_HEIGHT)
+        self.browser_group.setMinimumHeight(MIN_BROWSER_HEIGHT)
         self.left_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        _configure_splitter(self.left_splitter, collapsible=True)
         self.left_splitter.addWidget(self.sections_group)
         self.left_splitter.addWidget(self.browser_group)
         self.left_splitter.setStretchFactor(0, 3)
         self.left_splitter.setStretchFactor(1, 2)
+        self.left_splitter.setMinimumWidth(MIN_LEFT_PANE_WIDTH)
 
         self.details_group = self._build_details_group()
+        self.details_group.setMinimumWidth(MIN_RIGHT_PANE_WIDTH)
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        _configure_splitter(self.main_splitter)
         self.main_splitter.addWidget(self.left_splitter)
         self.main_splitter.addWidget(self.details_group)
         self.main_splitter.setStretchFactor(0, 2)
         self.main_splitter.setStretchFactor(1, 3)
 
         self.console_group = self._build_console_group()
+        self.console_group.setMinimumHeight(MIN_CONSOLE_HEIGHT)
         self.body_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        _configure_splitter(self.body_splitter, collapsible=True)
         self.body_splitter.addWidget(self.main_splitter)
         self.body_splitter.addWidget(self.console_group)
         self.body_splitter.setStretchFactor(0, 7)
@@ -2322,10 +2354,13 @@ class MainWindow(QMainWindow):
         self.function_decompilation_insights_tabs.addTab(decompilation_context_tab, "Context")
         self.function_decompilation_insights_tabs.setDocumentMode(True)
         self.function_decompilation_splitter = QSplitter(Qt.Orientation.Vertical, parent)
+        _configure_splitter(self.function_decompilation_splitter)
         self.function_decompilation_splitter.addWidget(self.function_decompilation_preview)
         self.function_decompilation_splitter.addWidget(self.function_decompilation_insights_tabs)
         self.function_decompilation_splitter.setStretchFactor(0, 5)
         self.function_decompilation_splitter.setStretchFactor(1, 3)
+        self.function_decompilation_preview.setMinimumHeight(MIN_HLL_PREVIEW_HEIGHT)
+        self.function_decompilation_insights_tabs.setMinimumHeight(MIN_HLL_INSIGHTS_HEIGHT)
         decompilation_layout.addLayout(decompilation_controls)
         decompilation_layout.addWidget(self.function_decompilation_summary)
         decompilation_layout.addWidget(self.function_decompilation_splitter, stretch=1)
@@ -3070,6 +3105,13 @@ class MainWindow(QMainWindow):
         self.left_splitter.setSizes([360, 280])
         self.main_splitter.setSizes([460, 900])
         self.body_splitter.setSizes([720, 180])
+        self.function_decompilation_splitter.setSizes([520, 260])
+
+    def reset_layout(self) -> None:
+        self.toggle_browser_action.setChecked(True)
+        self.toggle_console_action.setChecked(True)
+        self._apply_default_splitter_layout()
+        self._set_status("Layout reset.", 2500)
 
     def _toggle_browser_pane(self, checked: bool) -> None:
         current_sizes = self.left_splitter.sizes()

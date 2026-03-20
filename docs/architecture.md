@@ -67,7 +67,7 @@ Responsibilities:
 - return full function disassembly with `pdfj`
 - detect available radare2 decompilation backends and decompile through `pdg`, `pdd`, or `pdc`
 - capture backend metadata, fallback state, warnings, and line/address correlations for HLL output when available
-- apply display-side `Clean HLL` heuristics for import thunks, static registration, fini teardown, stack-canary scaffolding, and declaration noise
+- apply display-side `Clean HLL` heuristics for import thunks, static registration, fini teardown, stack-canary scaffolding, stack probes, scoped stack-object wrappers, and declaration noise
 - return function CFGs with `agfj`
 - build a cross-format binary metadata report from `ij`, `iSj`, `iej`, `ilj`, and `iij`
 
@@ -206,9 +206,10 @@ Function inspector:
 - inline semantic HLL links for matched functions, imports, strings, and symbols when the text match is unambiguous
 - HLL call summary and extracted argument/local declaration summary
 - backend JSON-aware HLL extraction for calls and declarations, with text parsing fallback
-- display-side HLL cleanup that can collapse import thunks, static registration, fini teardown, stack-canary scaffolding, and leading temp declarations
+- display-side HLL cleanup that can collapse import thunks, static registration, fini teardown, stack-canary scaffolding, stack probes, scoped stack-object wrappers, and leading temp declarations into a single summary block even when the decompiler inserts blank lines between the signature and function body
 - CFG tab with clickable basic blocks
 - clickable target links that navigate within the current function or into another loaded function
+- thicker splitter handles, minimum pane sizes, browser/console visibility toggles, and a `Reset Layout` action to recover from cramped layouts
 
 String inspector:
 
@@ -300,7 +301,7 @@ Why this matters:
 2. `aflj` results populate the function table.
 3. User selects a function.
 4. `pdfj @ <addr>`, the selected or best available decompilation command from `pdg`/`pdd`/`pdc`, and `agfj @ <addr>` run in the background.
-5. The function inspector updates with metadata, formatted disassembly, an HLL-style view with backend status, an optional `Clean HLL` presentation layer, optional clickable line/address mappings, inline semantic links, extracted declaration and call summaries, a correlated context table, and a clickable control-flow graph.
+5. The function inspector updates with metadata, formatted disassembly, an HLL-style view with backend status, an optional `Clean HLL` presentation layer, optional clickable line/address mappings, inline semantic links, extracted declaration and call summaries, a correlated context table, and a clickable control-flow graph. The cleaned view can condense mixed real/temp leading declaration blocks into a single summary comment instead of repeating multiple `/* temporaries omitted */` markers.
 
 ### String Flow
 
@@ -372,6 +373,7 @@ Current test coverage in [`src/test_main.py`](/home/gary/PycharmProjects/IronVie
 - radare2 function listing and function disassembly
 - radare2 function decompilation, backend fallback, and HLL metadata/correlation parsing
 - clean-mode HLL rendering heuristics for the current display-side simplification layer
+- resilient splitter/layout defaults and reset behavior for the main GUI work areas
 - radare2 function CFG loading
 - radare2 string listing and xrefs
 - radare2 import listing and callers

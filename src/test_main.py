@@ -906,6 +906,115 @@ def test_function_decompilation_html_collapses_stack_probe_and_pointer_slot_nois
     assert "return 0;" in rendered
 
 
+def test_function_decompilation_html_collapses_scoped_stack_object_lifetime() -> None:
+    function = FunctionInfo("main", 0x406000, 0x30, 4, "sym", "uint main(int argc,char **argv);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text=(
+            "uint main(int argc,char **argv)\n"
+            "{\n"
+            "    uchar auStack_38 [40];\n"
+            "    fcn.00415650(auStack_38);\n"
+            "    uVar1 = fcn.00406f20(auStack_38,argc,argv);\n"
+            "    fcn.00415670(auStack_38);\n"
+            "    return uVar1;\n"
+            "}\n"
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "fcn.00415650(auStack_38);" not in rendered
+    assert "fcn.00415670(auStack_38);" not in rendered
+    assert "/* scoped stack object auStack_38 lifetime simplified */" in rendered
+    assert "return fcn.00406f20(auStack_38,argc,argv);" in rendered
+
+
+def test_function_decompilation_html_hides_extended_decompiler_temp_families() -> None:
+    function = FunctionInfo("main", 0x5000, 0x40, 4, "sym", "uint64_t main(int argc,char **argv);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text=(
+            "uint64_t main(int argc,char **argv)\n"
+            "{\n"
+            "    int extraout_EDX;\n"
+            "    void **unaff_R12;\n"
+            "    char **in_XMM2_Qa;\n"
+            "    char **n_00;\n"
+            "    char **ppcStack_1a8;\n"
+            "    void **ppvVar4;\n"
+            "    void *pvVar17;\n"
+            "    FILE *pFVar18;\n"
+            "    void **ppvStack_128;\n"
+            "    void *apvStack_f8 [2];\n"
+            "    size_t asStack_108 [2];\n"
+            "    FILE *stream;\n"
+            "    char **s2;\n"
+            "    stream = NULL;\n"
+            "    return 0;\n"
+            "}\n"
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "extraout_EDX" not in rendered
+    assert "unaff_R12" not in rendered
+    assert "in_XMM2_Qa" not in rendered
+    assert "n_00" not in rendered
+    assert "ppcStack_1a8" not in rendered
+    assert "ppvVar4" not in rendered
+    assert "pvVar17" not in rendered
+    assert "pFVar18" not in rendered
+    assert "ppvStack_128" not in rendered
+    assert "apvStack_f8" not in rendered
+    assert "asStack_108" not in rendered
+    assert "s2" not in rendered
+    assert "locals: stream" in rendered
+    assert "temporaries omitted" in rendered
+    assert "stream = NULL;" in rendered
+    assert "return 0;" in rendered
+
+
+def test_function_decompilation_html_summarizes_leading_declarations_with_blank_line_after_signature() -> None:
+    function = FunctionInfo("main", 0x5000, 0x40, 4, "sym", "uint64_t main(int argc,char **argv);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text=(
+            "uint64_t main(int argc,char **argv)\n"
+            "\n"
+            "{\n"
+            "    /* temporaries omitted */\n"
+            "    char *s;\n"
+            "    /* temporaries omitted */\n"
+            "    size_t n;\n"
+            "    /* temporaries omitted */\n"
+            "    FILE *stream;\n"
+            "    /* temporaries omitted */\n"
+            "    return 0;\n"
+            "}\n"
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "/* temporaries omitted */" not in rendered
+    assert "locals: s, n, stream; 4 temporaries omitted" in rendered
+    assert "return 0;" in rendered
+
+
 def test_function_decompilation_html_renders_inline_context_links() -> None:
     function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
     result = FunctionDecompilationResult(
@@ -1575,6 +1684,28 @@ def test_main_window_can_toggle_console_pane(qt_app: QApplication) -> None:
 
     assert window.toggle_console_action.isChecked()
     assert restored_sizes[1] > 0
+    window.close()
+
+
+def test_main_window_can_reset_layout(qt_app: QApplication) -> None:
+    window = MainWindow()
+    window.show()
+    qt_app.processEvents()
+
+    window.toggle_browser_action.trigger()
+    window.toggle_console_action.trigger()
+    qt_app.processEvents()
+    assert window.left_splitter.sizes()[1] == 0
+    assert window.body_splitter.sizes()[1] == 0
+
+    window.reset_layout()
+    qt_app.processEvents()
+
+    assert window.toggle_browser_action.isChecked()
+    assert window.toggle_console_action.isChecked()
+    assert window.left_splitter.sizes()[1] > 0
+    assert window.body_splitter.sizes()[1] > 0
+    assert window.function_decompilation_splitter.handleWidth() >= 10
     window.close()
 
 
