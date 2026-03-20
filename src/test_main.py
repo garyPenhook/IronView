@@ -44,7 +44,9 @@ from src.gui import (
     AddressMetadataWorker,
     DARK_THEME,
     ErrorInfo,
+    FunctionDisassemblyWorker,
     FunctionDecompilationWorker,
+    FunctionGraphWorker,
     GhidraReportWorker,
     HllCallItem,
     HllContextItem,
@@ -385,6 +387,42 @@ def test_radare2_decompile_function_includes_metadata_and_line_mappings() -> Non
     assert any("pdc output is heuristic" in warning for warning in result.warnings)
     assert any("Only the built-in pdc backend is installed" in warning for warning in result.warnings)
     assert fake_r2.commands == ["pdg?", "pdd?", "pdc?", "pdc @ 4198400"]
+
+
+def test_radare2_decompile_function_skips_detailed_metadata_for_large_functions() -> None:
+    class FakeR2:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def cmd(self, command: str) -> str:
+            self.commands.append(command)
+            responses = {
+                "pdg?": "Usage: pdg decompile current function",
+                "pdd?": "Usage: pdd decompile current function",
+                "pdc?": "Usage: pdc pseudo decompile function",
+                "pdg @ 4198400": "int main(void) {\n    return 0;\n}",
+            }
+            return responses[command]
+
+        def cmdj(self, command: str) -> dict[str, object]:
+            raise AssertionError(f"structured metadata should not be requested: {command}")
+
+    function = FunctionInfo("main", 0x401000, 0x20, 601, "sym", "int main(void);")
+    disassembler = Radare2Disassembler("/bin/ls")
+    fake_r2 = FakeR2()
+    disassembler._r2 = fake_r2
+    disassembler._architecture = "x86"
+    disassembler._bits = 64
+
+    result = disassembler.decompile_function(function)
+
+    assert result.backend == "pdg"
+    assert result.detailed_metadata_loaded is False
+    assert result.raw_json is None
+    assert result.annotations == ()
+    assert result.line_mappings == ()
+    assert any("Detailed HLL metadata was skipped" in warning for warning in result.warnings)
+    assert fake_r2.commands == ["pdg?", "pdd?", "pdc?", "pdg @ 4198400"]
 
 
 def test_radare2_decompile_function_simplifies_import_thunk_pdc_output() -> None:
@@ -1542,6 +1580,54 @@ def test_main_window_loads_function_decompilation(qt_app: QApplication) -> None:
     window.close()
 
 
+def test_main_window_large_hll_skips_detailed_context_processing(
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow()
+    function = FunctionInfo("main", 0x401000, 0x30, 700, "sym", "int main(int argc, char **argv);")
+    result = FunctionDecompilationResult(
+        path=Path("/bin/ls"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        backend_display_name="r2ghidra (pdg)",
+        text="int main(int argc, char **argv) {\n    char *buffer;\n    return argc;\n}\n",
+        warnings=("Detailed HLL metadata was skipped for this large function to improve load time.",),
+        detailed_metadata_loaded=False,
+    )
+    window._current_path = Path("/bin/ls")
+    window._selected_function_address = function.address
+
+    def fail_context_correlation(*args: object, **kwargs: object) -> tuple[HllContextItem, ...]:
+        raise AssertionError("context correlation should be skipped for large HLL results")
+
+    monkeypatch.setattr("src.gui._correlate_function_decompilation_context", fail_context_correlation)
+
+    window._on_function_decompilation_loaded(
+        LoadedFunctionDecompilation(
+            path=Path("/bin/ls"),
+            function_address=function.address,
+            requested_backend=None,
+            result=result,
+        )
+    )
+    qt_app.processEvents()
+
+    assert window.function_decompilation_calls_table.rowCount() == 0
+    assert window.function_decompilation_context_table.rowCount() == 0
+    assert window.function_decompilation_calls_summary.text() == (
+        "Detailed HLL call extraction was skipped for this large function."
+    )
+    assert window.function_decompilation_context_summary.text() == (
+        "Detailed HLL context correlation was skipped for this large function."
+    )
+    assert window.function_decompilation_declarations_value.text() == "Args: argc, argv | Locals: buffer"
+    assert "return argc;" in window.function_decompilation_preview.toPlainText()
+    window.close()
+
+
 def test_main_window_load_selected_function_decompilation_uses_selected_backend(
     qt_app: QApplication,
     monkeypatch: pytest.MonkeyPatch,
@@ -1607,7 +1693,7 @@ def test_main_window_can_toggle_clean_hll_rendering(qt_app: QApplication) -> Non
     window.close()
 
 
-def test_main_window_direct_function_selection_defaults_to_hll(
+def test_main_window_direct_function_selection_loads_disassembly_only_by_default(
     qt_app: QApplication,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1615,14 +1701,55 @@ def test_main_window_direct_function_selection_defaults_to_hll(
     function = FunctionInfo("main", 0x401000, 0x30, 3, "sym", "int main(void);")
     window._current_path = Path("/bin/ls")
     window._populate_functions_table((function,))
-    monkeypatch.setattr(window._thread_pool, "start", lambda _worker: None)
+    started: list[object] = []
+
+    def capture_start(worker: object) -> None:
+        started.append(worker)
+
+    monkeypatch.setattr(window._thread_pool, "start", capture_start)
 
     window.functions_table.selectRow(0)
     window._on_function_selection_changed()
     qt_app.processEvents()
 
-    assert window.function_preview_tabs.currentIndex() == 1
+    assert window.function_preview_tabs.currentIndex() == 0
+    assert any(isinstance(worker, FunctionDisassemblyWorker) for worker in started)
+    assert any(isinstance(worker, AddressMetadataWorker) for worker in started)
+    assert not any(isinstance(worker, FunctionDecompilationWorker) for worker in started)
+    assert not any(isinstance(worker, FunctionGraphWorker) for worker in started)
     assert window.function_decompilation_insights_tabs.count() == 3
+    window.close()
+
+
+def test_main_window_function_preview_tab_change_loads_hll_and_cfg_on_demand(
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow()
+    function = FunctionInfo("main", 0x401000, 0x30, 3, "sym", "int main(void);")
+    window._current_path = Path("/bin/ls")
+    window._populate_functions_table((function,))
+    started: list[object] = []
+
+    def capture_start(worker: object) -> None:
+        started.append(worker)
+
+    monkeypatch.setattr(window._thread_pool, "start", capture_start)
+
+    window.functions_table.selectRow(0)
+    window._on_function_selection_changed()
+    qt_app.processEvents()
+    started.clear()
+
+    window.function_preview_tabs.setCurrentIndex(1)
+    qt_app.processEvents()
+    assert any(isinstance(worker, FunctionDecompilationWorker) for worker in started)
+    assert not any(isinstance(worker, FunctionGraphWorker) for worker in started)
+
+    started.clear()
+    window.function_preview_tabs.setCurrentIndex(2)
+    qt_app.processEvents()
+    assert any(isinstance(worker, FunctionGraphWorker) for worker in started)
     window.close()
 
 
