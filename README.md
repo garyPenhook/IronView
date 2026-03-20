@@ -6,6 +6,7 @@ It combines four pieces:
 - `libbfd` for section metadata and raw section bytes
 - `PySide6` for the Qt GUI
 - `radare2` through `r2pipe` for disassembly and function discovery
+- optional `Ghidra` for external GUI work and headless analysis reports
 - GNU toolchain helpers like `addr2line`, `c++filt`, `nm`, `readelf`, and `gdb`
 
 The project supports both GUI and CLI workflows.
@@ -47,6 +48,8 @@ The project supports both GUI and CLI workflows.
 - Resolve demangled names with `c++filt`
 - Resolve source locations with `addr2line` for ELF binaries when debug data is available
 - Inspect cross-format binary metadata and linked libraries for `ELF`, `PE/COFF`, and `Mach-O`
+- Launch `Ghidra` from the GUI
+- Run an in-app `Ghidra` headless analysis report for the loaded binary
 - Switch between light and dark themes
 - View a bottom system console with runtime events and analysis activity
 - Run Linux shell commands from the bottom console
@@ -62,6 +65,7 @@ The project supports both GUI and CLI workflows.
 - `radare2` available in `PATH`
 - The current documented and locally verified baseline is `radare2 6.1.1`
 - optional radare2 decompiler plugins such as `r2ghidra` (`pdg`) or `r2dec` (`pdd`) for richer HLL output
+- optional `Ghidra` with `ghidra` and `analyzeHeadless` available for GUI launch and headless reports
 - GNU userland tools: `addr2line`, `c++filt`, `nm`, `readelf`, and optionally `gdb`
 - A Linux desktop session for the GUI
 
@@ -138,6 +142,7 @@ uv run python -m src.main /bin/ls --section .text
 23. Use `View > Show Browser` and `View > Show Console` to reclaim space when focusing on HLL, disassembly, or CFG work.
 24. Use `Run Codex` to launch `codex` in an external terminal with a real TTY.
 25. Use `Run GDB` to launch `gdb` for the current binary in an external terminal.
+26. Use `Launch Ghidra` to open the external Ghidra GUI, or `Run Headless Analysis` in the `Binary` tab to collect a Ghidra report inside IronView.
 
 ## CLI Behavior
 
@@ -156,6 +161,7 @@ At a high level:
 
 - [`src/binary_loader.py`](/home/gary/PycharmProjects/IronView/src/binary_loader.py) wraps `libbfd`
 - [`src/disassembler.py`](/home/gary/PycharmProjects/IronView/src/disassembler.py) wraps `radare2`
+- [`src/ghidra_toolchain.py`](/home/gary/PycharmProjects/IronView/src/ghidra_toolchain.py) wraps optional `Ghidra` launch and headless analysis
 - [`src/gnu_toolchain.py`](/home/gary/PycharmProjects/IronView/src/gnu_toolchain.py) wraps GNU binutils helpers
 - [`src/gui.py`](/home/gary/PycharmProjects/IronView/src/gui.py) implements the Qt application
 - [`src/main.py`](/home/gary/PycharmProjects/IronView/src/main.py) is the CLI/GUI entrypoint
@@ -172,7 +178,7 @@ QT_QPA_PLATFORM=offscreen uv run pytest
 Run a syntax check:
 
 ```bash
-python3 -m py_compile src/gnu_toolchain.py src/disassembler.py src/gui.py src/main.py src/binary_loader.py src/test_main.py
+python3 -m py_compile src/ghidra_toolchain.py src/gnu_toolchain.py src/disassembler.py src/gui.py src/main.py src/binary_loader.py src/test_main.py
 ```
 
 ## Known Limits
@@ -184,4 +190,5 @@ python3 -m py_compile src/gnu_toolchain.py src/disassembler.py src/gui.py src/ma
 - `PE/COFF` and `Mach-O` currently use the `libbfd` and radare2 paths, while GNU `addr2line` source lookup remains intentionally disabled for them.
 - Source mapping depends on debug info being present in or reachable from the binary.
 - The current radare2 integration covers sections, strings, imports, exports, relocations, symbols, functions, xrefs/callers, disassembly, HLL-style output through `pdg`/`pdd`/`pdc` fallback, `Clean HLL` rendering heuristics, and first-pass CFG views.
+- The current Ghidra integration is intentionally shallow: external GUI launch plus on-demand headless report collection.
 - `Clean HLL` is a presentation layer. It improves readability, but it does not replace a real source-level decompiler or guarantee semantically correct rewrites.

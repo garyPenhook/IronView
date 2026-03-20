@@ -49,8 +49,14 @@ GOTO_CODE_LABEL_PATTERN = re.compile(r"\bgoto\s+code_r0x[0-9a-fA-F]+;")
 STACK_CANARY_INIT_PATTERN = re.compile(
     r"^(?P<indent>\s*)(?P<slot>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\*\(in_FS_OFFSET \+ 0x28\);\s*$"
 )
+STACK_CANARY_PTR_INIT_PATTERN = re.compile(
+    r"^(?P<indent>\s*)\*\((?P<slot>[A-Za-z_][A-Za-z0-9_]* \+ [+-]?0x[0-9a-fA-F]+)\)\s*=\s*\*\(in_FS_OFFSET \+ 0x28\);\s*$"
+)
 STACK_CANARY_CHECK_PATTERN = re.compile(
     r"^(?P<indent>\s*)if\s+\(\*\(in_FS_OFFSET \+ 0x28\)\s*!=\s*(?P<slot>[A-Za-z_][A-Za-z0-9_]*)\)\s*\{\s*$"
+)
+STACK_CANARY_PTR_RETURN_PATTERN = re.compile(
+    r"^(?P<indent>\s*)if\s+\(\*\((?P<slot>[A-Za-z_][A-Za-z0-9_]* \+ [+-]?0x[0-9a-fA-F]+)\)\s*==\s*\*\(in_FS_OFFSET \+ 0x28\)\)\s*\{\s*$"
 )
 STACK_FAIL_PATTERN = re.compile(r"^\s*import\.__stack_chk_fail\(\);\s*$")
 DECLARATION_NAME_PATTERN = re.compile(
@@ -64,8 +70,30 @@ TEMP_LOCAL_NAME_PATTERN = re.compile(
     r"^(?:"
     r"(?:pc|ppc|pu|pi|pb|psz|ps|p|i|u|b|c|au|ai|f)d?Var\d+"
     r"|(?:pc|u|i|ai|au|f|b)Stack_[0-9A-Fa-f]+"
+    r"|in_[A-Z0-9]+"
     r"|in_FS_OFFSET"
     r")$"
+)
+CONCAT_REGISTER_ARG_PATTERN = re.compile(
+    r"\bCONCAT\d+\(\s*in_[A-Z0-9]+\s*,\s*(?P<argument>[A-Za-z_][A-Za-z0-9_]*)\s*\)"
+)
+STACK_PROBE_INIT_PATTERN = re.compile(
+    r"^(?P<indent>\s*)(?P<ptr>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*&stack0x[0-9a-fA-F]+;\s*$"
+)
+STACK_PROBE_COPY_PATTERN = re.compile(
+    r"^(?P<indent>\s*)(?P<dst>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<src>[A-Za-z_][A-Za-z0-9_]*);\s*$"
+)
+STACK_PROBE_TOUCH_PATTERN = re.compile(
+    r"^(?P<indent>\s*)\*\((?P<ptr>[A-Za-z_][A-Za-z0-9_]*) \+ -0x1000\)\s*=\s*\*\((?P=ptr) \+ -0x1000\);\s*$"
+)
+STACK_PROBE_STEP_PATTERN = re.compile(
+    r"^(?P<indent>\s*)(?P<dst>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<src>[A-Za-z_][A-Za-z0-9_]*) \+ -0x1000;\s*$"
+)
+STACK_PROBE_WHILE_PATTERN = re.compile(
+    r"^(?P<indent>\s*)\}\s*while\s+\((?P<ptr>[A-Za-z_][A-Za-z0-9_]*) \+ -0x1000 != &stack0x[0-9a-fA-F]+\);\s*$"
+)
+STACK_SLOT_MARKER_PATTERN = re.compile(
+    r"^\s*\*\((?P<ptr>[A-Za-z_][A-Za-z0-9_]*) \+ [+-]?0x[0-9a-fA-F]+\)\s*=\s*0x[0-9a-fA-F]+;\s*$"
 )
 
 
@@ -307,6 +335,7 @@ def format_function_decompilation_html(
         rendered_lines = _collapse_temp_declaration_lines(rendered_lines)
         rendered_lines = _collapse_cpp_registration_lines(rendered_lines)
         rendered_lines = _collapse_fini_teardown_lines(rendered_lines)
+        rendered_lines = _collapse_stack_probe_lines(rendered_lines)
         rendered_lines = _collapse_stack_canary_lines(rendered_lines)
         rendered_lines = _summarize_leading_declaration_block(rendered_lines)
         rendered_lines = _collapse_import_thunk_lines(result.function, rendered_lines)
@@ -355,6 +384,7 @@ def _clean_decompilation_lines(text: str) -> tuple[str, ...]:
         line = re.sub(r"\bimp\.", "import.", line)
         line = re.sub(r"\bimport\.operator_new(?:_unsigned_long_)?\b", "import.operator_new", line)
         line = GOTO_CODE_LABEL_PATTERN.sub("goto exit;", line)
+        line = CONCAT_REGISTER_ARG_PATTERN.sub(lambda match: match.group("argument"), line)
         line = re.sub(r"==\s*'\\0'", "== 0", line)
         line = re.sub(r"!=\s*'\\0'", "!= 0", line)
         line = re.sub(r"=\s*'\\0'", "= 0", line)
@@ -458,7 +488,8 @@ def _collapse_stack_canary_lines(lines: Sequence[str]) -> tuple[str, ...]:
     index = 0
     while index < len(lines):
         init_match = STACK_CANARY_INIT_PATTERN.match(lines[index])
-        if init_match is not None:
+        ptr_init_match = STACK_CANARY_PTR_INIT_PATTERN.match(lines[index])
+        if init_match is not None or ptr_init_match is not None:
             index += 1
             continue
         if index + 2 < len(lines):
@@ -471,11 +502,13 @@ def _collapse_stack_canary_lines(lines: Sequence[str]) -> tuple[str, ...]:
         if index + 3 < len(lines):
             stripped_line = lines[index].strip()
             return_check = STACK_CANARY_RETURN_PATTERN.match(lines[index])
+            ptr_return_check = STACK_CANARY_PTR_RETURN_PATTERN.match(lines[index])
             return_line = RETURN_VALUE_PATTERN.match(lines[index + 1])
             fail_match = STACK_FAIL_PATTERN.match(lines[index + 3])
             if (
                 (
                     return_check is not None
+                    or ptr_return_check is not None
                     or (
                         stripped_line.startswith("if (")
                         and stripped_line.endswith("{")
@@ -487,13 +520,54 @@ def _collapse_stack_canary_lines(lines: Sequence[str]) -> tuple[str, ...]:
                 and lines[index + 2].strip() == "}"
                 and fail_match is not None
             ):
-                indent = return_check.group("indent") if return_check is not None else lines[index][: len(lines[index]) - len(lines[index].lstrip())]
+                indent = (
+                    return_check.group("indent")
+                    if return_check is not None
+                    else ptr_return_check.group("indent")
+                    if ptr_return_check is not None
+                    else lines[index][: len(lines[index]) - len(lines[index].lstrip())]
+                )
                 collapsed.append(f"{indent}check_stack_canary(); /* simplified */")
                 collapsed.append(lines[index + 1])
                 index += 4
                 continue
         declaration_match = DECLARATION_NAME_PATTERN.match(lines[index])
         if declaration_match is not None and declaration_match.group("name") in canary_slots.union({"in_FS_OFFSET"}):
+            index += 1
+            continue
+        collapsed.append(lines[index])
+        index += 1
+    return tuple(collapsed)
+
+
+def _collapse_stack_probe_lines(lines: Sequence[str]) -> tuple[str, ...]:
+    collapsed: list[str] = []
+    index = 0
+    while index < len(lines):
+        if index + 4 < len(lines):
+            init_match = STACK_PROBE_INIT_PATTERN.match(lines[index])
+            copy_match = STACK_PROBE_COPY_PATTERN.match(lines[index + 2])
+            touch_match = STACK_PROBE_TOUCH_PATTERN.match(lines[index + 3])
+            step_match = STACK_PROBE_STEP_PATTERN.match(lines[index + 4])
+            while_match = STACK_PROBE_WHILE_PATTERN.match(lines[index + 5]) if index + 5 < len(lines) else None
+            if (
+                init_match is not None
+                and lines[index + 1].strip() == "do {"
+                and copy_match is not None
+                and touch_match is not None
+                and step_match is not None
+                and while_match is not None
+                and copy_match.group("src") == init_match.group("ptr")
+                and touch_match.group("ptr") == copy_match.group("dst")
+                and step_match.group("src") == copy_match.group("dst")
+                and step_match.group("dst") == init_match.group("ptr")
+                and while_match.group("ptr") == copy_match.group("dst")
+            ):
+                collapsed.append(f"{init_match.group('indent')}/* stack probe omitted */")
+                index += 6
+                continue
+        marker_match = STACK_SLOT_MARKER_PATTERN.match(lines[index])
+        if marker_match is not None and TEMP_LOCAL_NAME_PATTERN.match(marker_match.group("ptr")) is not None:
             index += 1
             continue
         collapsed.append(lines[index])
@@ -579,14 +653,18 @@ def _collapse_import_thunk_lines(
         return tuple(lines)
     header = compact_lines[0].strip()
     stripped_name = function.name.strip()
-    header_name_match = re.search(r"\b(import\.[A-Za-z_][A-Za-z0-9_$.@?]*)\s*\(", header)
+    header_name_match = re.search(r"\b(import\.[A-Za-z_][A-Za-z0-9_$.@?:]*)\s*\(", header)
     header_name = header_name_match.group(1).strip() if header_name_match is not None else ""
     import_name = stripped_name if stripped_name.startswith("import.") else header_name
     if not import_name.startswith("import."):
         return tuple(lines)
     if compact_lines[1].strip() != "{":
         return tuple(lines)
-    body_lines = [line.strip() for line in compact_lines[2:-1] if line.strip()]
+    body_lines = [
+        line.strip()
+        for line in compact_lines[2:-1]
+        if line.strip() and not line.strip().startswith("//")
+    ]
     if compact_lines[-1].strip() != "}" or not body_lines:
         return tuple(lines)
     if len(body_lines) == 2 and body_lines[-1] == "return;" and IMPORT_THUNK_CALL_PATTERN.match(body_lines[0]):

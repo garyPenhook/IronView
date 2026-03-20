@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWidgets import QApplication, QTableWidgetItem
 
 import src.binary_loader
+import src.ghidra_toolchain
 import src.gnu_toolchain
 from src.binary_loader import BinaryImage, BinaryLoader, BinaryLoaderError
 from src.disassembler import (
@@ -37,18 +38,21 @@ from src.disassembler import (
     format_function_disassembly,
     format_function_disassembly_html,
 )
+from src.ghidra_toolchain import GhidraHeadlessReport, GhidraInstallation, GhidraToolchain
 from src.gnu_toolchain import GnuToolchain, GnuToolchainError, SymbolInfo
 from src.gui import (
     AddressMetadataWorker,
     DARK_THEME,
     ErrorInfo,
     FunctionDecompilationWorker,
+    GhidraReportWorker,
     HllCallItem,
     HllContextItem,
     HllDeclarationSummary,
     LIGHT_THEME,
     LoadedBinaryReport,
     LoadedExportXrefs,
+    LoadedGhidraReport,
     LoadedImage,
     LoadedFunctionDecompilation,
     LoadedRelocationXrefs,
@@ -184,6 +188,62 @@ def test_main_cli_json_includes_format_metadata(sample_binary: Path, capsys: pyt
 
     assert payload["file_format"] == "ELF"
     assert "elf" in payload["target"].lower()
+
+
+def test_ghidra_toolchain_builds_headless_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    installation = GhidraInstallation(
+        version="12.0.4",
+        ghidra_path=Path("/usr/bin/ghidra"),
+        analyze_headless_path=Path("/usr/share/ghidra/support/analyzeHeadless"),
+    )
+    monkeypatch.setattr(GhidraToolchain, "detect_installation", classmethod(lambda cls: installation))
+
+    toolchain = GhidraToolchain("/bin/ls")
+    command, project_root, project_name = toolchain.build_headless_command(
+        project_root=tmp_path,
+        timeout_seconds=90,
+    )
+
+    assert command == [
+        "/usr/share/ghidra/support/analyzeHeadless",
+        str(tmp_path.resolve()),
+        "ls_ironview",
+        "-import",
+        str(Path("/bin/ls").resolve()),
+        "-overwrite",
+        "-readOnly",
+        "-analysisTimeoutPerFile",
+        "90",
+        "-deleteProject",
+    ]
+    assert project_root == tmp_path.resolve()
+    assert project_name == "ls_ironview"
+
+
+def test_ghidra_toolchain_runs_headless_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    installation = GhidraInstallation(
+        version="12.0.4",
+        ghidra_path=Path("/usr/bin/ghidra"),
+        analyze_headless_path=Path("/usr/share/ghidra/support/analyzeHeadless"),
+    )
+    monkeypatch.setattr(GhidraToolchain, "detect_installation", classmethod(lambda cls: installation))
+    monkeypatch.setattr(
+        src.ghidra_toolchain.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0],
+            0,
+            stdout="analysis ok\nimported /bin/ls\n",
+            stderr="",
+        ),
+    )
+
+    report = GhidraToolchain("/bin/ls").run_headless_analysis(project_root=tmp_path)
+
+    assert report.summary == "Ghidra 12.0.4 headless analyzed ls"
+    assert f"Binary: {Path('/bin/ls').resolve()}" in report.text
+    assert "analysis ok" in report.text
+    assert report.project_name == "ls_ironview"
 
 
 def test_matches_section_filter_checks_name_and_addresses(sample_binary: Path) -> None:
@@ -610,6 +670,38 @@ def test_function_decompilation_html_collapses_import_thunk_using_header_name() 
     assert "import.as_system_info_get_modaliases();" in rendered
 
 
+def test_function_decompilation_html_collapses_import_thunk_with_comment_banner() -> None:
+    function = FunctionInfo(
+        "sym.imp.llvm::StringRef::starts_with_insensitive_llvm::StringRef__const",
+        0x2F198,
+        0x20,
+        2,
+        "sym",
+        "void import.llvm::StringRef::starts_with_insensitive_llvm::StringRef__const(void);",
+    )
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text=(
+            "void import.llvm::StringRef::starts_with_insensitive_llvm::StringRef__const(void)\n"
+            "{\n"
+            "    //llvm::StringRef::starts_with_insensitive(llvm::StringRef) const\n"
+            "    (*g_2F198)();\n"
+            "    return;\n"
+            "}\n"
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "(*g_2F198)();" not in rendered
+    assert "StringRef::starts_with_insensitive" in rendered
+    assert "/* import thunk */" in rendered
+
+
 def test_function_decompilation_html_collapses_cpp_atexit_registration_sequence() -> None:
     function = FunctionInfo("entry.init2", 0x13EAB0, 0x40, 6, "sym", "void entry.init2(void);")
     result = FunctionDecompilationResult(
@@ -741,6 +833,77 @@ def test_function_decompilation_html_collapses_temp_declarations_and_return_styl
     assert "check_stack_canary(); /* simplified */" in rendered
     assert "return uVar11;" in rendered
     assert "__stack_chk_fail" not in rendered
+
+
+def test_function_decompilation_html_simplifies_concat_register_wrapper_arguments() -> None:
+    function = FunctionInfo("main", 0xEA00, 0x20, 3, "sym", "ulong main(int argc,char **argv,char **envp);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text=(
+            "ulong main(int argc,char **argv,char **envp)\n"
+            "{\n"
+            "    uint in_RDI;\n"
+            "    fcn.0000ea00(CONCAT44(in_RDI,argc),argv);\n"
+            "    fcn.0001dcf0();\n"
+            "    return 0;\n"
+            "}\n"
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "in_RDI" not in rendered
+    assert "CONCAT44" not in rendered
+    assert "1 temporaries omitted" in rendered
+    assert "fcn.0000ea00(argc,argv);" in rendered
+    assert "fcn.0001dcf0();" in rendered
+    assert "return 0;" in rendered
+
+
+def test_function_decompilation_html_collapses_stack_probe_and_pointer_slot_noise() -> None:
+    function = FunctionInfo("main", 0x2400, 0x120, 12, "sym", "ulong main(int argc,char **argv);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text=(
+            "ulong main(int argc,char **argv)\n"
+            "{\n"
+            "    ulong *puVar11;\n"
+            "    ulong *puVar20;\n"
+            "    uchar auStack_10030 [65536];\n"
+            "    puVar11 = &stack0xffffffffffffffd0;\n"
+            "    do {\n"
+            "        puVar20 = puVar11;\n"
+            "        *(puVar20 + -0x1000) = *(puVar20 + -0x1000);\n"
+            "        puVar11 = puVar20 + -0x1000;\n"
+            "    } while (puVar20 + -0x1000 != &stack0xfffffffffffeffd0);\n"
+            "    *(puVar20 + 0xeff0) = *(in_FS_OFFSET + 0x28);\n"
+            "    *(puVar20 + -0x1660) = 0x2afe;\n"
+            "    import.puts(\"hello\");\n"
+            "    if (*(puVar20 + 0xeff0) == *(in_FS_OFFSET + 0x28)) {\n"
+            "        return 0;\n"
+            "    }\n"
+            "    import.__stack_chk_fail();\n"
+            "}\n"
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "&amp;stack0x" not in rendered
+    assert "puVar11 = &amp;stack0x" not in rendered
+    assert "*(puVar20 + -0x1660)" not in rendered
+    assert "/* stack probe omitted */" in rendered
+    assert "check_stack_canary(); /* simplified */" in rendered
+    assert "import.puts(&quot;hello&quot;);" in rendered
+    assert "return 0;" in rendered
 
 
 def test_function_decompilation_html_renders_inline_context_links() -> None:
@@ -1936,6 +2099,90 @@ def test_main_window_launch_gdb_terminal_logs_launch(
     qt_app.processEvents()
 
     assert "Launched gdb for ls in external terminal" in window.console.toPlainText()
+    window.close()
+
+
+def test_main_window_launch_ghidra_logs_launch(
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow()
+    window._current_path = Path("/bin/ls")
+    window._ghidra_installation = GhidraInstallation(
+        version="12.0.4",
+        ghidra_path=Path("/usr/bin/ghidra"),
+        analyze_headless_path=Path("/usr/share/ghidra/support/analyzeHeadless"),
+    )
+    monkeypatch.setattr("src.gui.QProcess.startDetached", lambda *args: (True, 1234))
+
+    window.launch_ghidra()
+    qt_app.processEvents()
+
+    assert "Launched Ghidra GUI. Import ls there" in window.console.toPlainText()
+    window.close()
+
+
+def test_main_window_runs_ghidra_headless_worker(
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow()
+    window._current_path = Path("/bin/ls")
+    window._current_image = BinaryImage(
+        path=Path("/bin/ls"),
+        arch_size=64,
+        target="elf64",
+        file_format="ELF",
+        sections=(),
+    )
+    window._ghidra_installation = GhidraInstallation(
+        version="12.0.4",
+        ghidra_path=Path("/usr/bin/ghidra"),
+        analyze_headless_path=Path("/usr/share/ghidra/support/analyzeHeadless"),
+    )
+    started_workers: list[object] = []
+    monkeypatch.setattr(window._thread_pool, "start", lambda worker: started_workers.append(worker))
+
+    window.run_ghidra_headless_analysis()
+    qt_app.processEvents()
+
+    assert len(started_workers) == 1
+    assert isinstance(started_workers[0], GhidraReportWorker)
+    assert "Running Ghidra headless analysis for ls" in window.console.toPlainText()
+    window.close()
+
+
+def test_main_window_updates_ghidra_report_panel(
+    qt_app: QApplication,
+) -> None:
+    window = MainWindow()
+    window._current_path = Path("/bin/ls")
+    window._current_image = BinaryImage(
+        path=Path("/bin/ls"),
+        arch_size=64,
+        target="elf64",
+        file_format="ELF",
+        sections=(),
+    )
+    report = GhidraHeadlessReport(
+        path=Path("/bin/ls"),
+        summary="Ghidra 12.0.4 headless analyzed ls",
+        text="analysis ok",
+        project_root=Path("/tmp/ghidra"),
+        project_name="ls_ironview",
+        command=("/usr/share/ghidra/support/analyzeHeadless",),
+        installation=GhidraInstallation(
+            version="12.0.4",
+            ghidra_path=Path("/usr/bin/ghidra"),
+            analyze_headless_path=Path("/usr/share/ghidra/support/analyzeHeadless"),
+        ),
+    )
+
+    window._on_ghidra_report_loaded(LoadedGhidraReport(path=Path("/bin/ls"), report=report))
+    qt_app.processEvents()
+
+    assert window.ghidra_summary_label.text() == "Ghidra 12.0.4 headless analyzed ls"
+    assert window.ghidra_report_view.toPlainText() == "analysis ok"
     window.close()
 
 

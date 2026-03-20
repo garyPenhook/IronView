@@ -4,10 +4,11 @@ This document describes the project structure after the initial GUI and radare2 
 
 ## Overview
 
-The application has three analysis backends and one presentation layer:
+The application has four analysis backends and one presentation layer:
 
 - `libbfd` for object/section inspection
 - `radare2` for disassembly and function discovery
+- optional `Ghidra` for external GUI work and headless analysis reports
 - GNU binutils helpers for symbols, demangling, source lookup, and ELF reporting
 - `PySide6` for the desktop UI
 
@@ -102,6 +103,17 @@ These helpers are currently treated as ELF-oriented in the GUI. For `PE/COFF`
 and `Mach-O`, the app keeps the `libbfd` and radare2 paths enabled and
 intentionally disables GNU report/source features.
 
+### [`src/ghidra_toolchain.py`](/home/gary/PycharmProjects/IronView/src/ghidra_toolchain.py)
+
+Optional Ghidra integration implemented with `subprocess`.
+
+Responsibilities:
+
+- detect `ghidra` and `analyzeHeadless` on the host
+- capture the locally installed Ghidra package version
+- build a deterministic `analyzeHeadless` command for the current binary
+- run on-demand headless analysis and return a textual report for the GUI
+
 ### [`src/gui.py`](/home/gary/PycharmProjects/IronView/src/gui.py)
 
 Qt desktop application built with `PySide6`.
@@ -121,6 +133,7 @@ Responsibilities:
 - load export xrefs in the background
 - load relocation xrefs in the background
 - load radare2 symbol lists, radare2 binary reports, and GNU source metadata when supported
+- run optional Ghidra headless analysis in the background
 - show section details, hex preview, and disassembly preview
 - show function metadata, demangled names, source locations, and full function disassembly
 - show string metadata and callers/xrefs
@@ -131,10 +144,12 @@ Responsibilities:
 - show relocation xrefs and navigate from them into functions
 - show symbol metadata and source locations
 - show a cross-format radare2 metadata report for the current binary
+- show optional Ghidra headless analysis output for the current binary
 - record runtime activity in a bottom system console
 - run shell commands through a `QProcess` command runner
 - launch `codex` in an external terminal session
 - launch `gdb` in an external terminal session
+- launch `Ghidra` as an external GUI application
 - manage export, theme switching, and application shutdown
 
 ## GUI Layout
@@ -166,6 +181,7 @@ The current window is organized as:
   - shell command input and command output
   - external `codex` launcher
   - external `gdb` launcher
+  - external `Ghidra` launcher
 - View controls:
   - collapsible browser pane
   - collapsible console pane
@@ -229,6 +245,10 @@ Binary inspector:
 - cross-format metadata summary
 - section, entrypoint, library, and import listings from radare2
 - linked-library table
+- `Ghidra` availability summary
+- `Launch Ghidra` action
+- `Run Headless Analysis` action
+- text report area for Ghidra headless output
 
 ## Background Work Model
 
@@ -319,6 +339,14 @@ Why this matters:
 5. The active inspector updates with demangled names and source-location metadata when available.
 6. `Run GDB` launches an external debugger session for the current binary.
 
+### Ghidra Flow
+
+1. The GUI detects `ghidra` / `analyzeHeadless` availability once at startup.
+2. The `Binary` inspector surfaces Ghidra availability and exposes launch actions.
+3. `Launch Ghidra` starts the external Ghidra GUI without blocking the Qt event loop.
+4. `Run Headless Analysis` starts a background worker that invokes `analyzeHeadless` for the current binary.
+5. The `Binary` inspector updates with the resulting headless report text or a structured failure message.
+
 ## Error Handling
 
 Errors are surfaced as application-level messages rather than uncaught worker failures.
@@ -353,6 +381,7 @@ Current test coverage in [`src/test_main.py`](/home/gary/PycharmProjects/IronVie
 - radare2 relocation xref loading
 - radare2 symbol listing
 - radare2 binary metadata reporting
+- Ghidra headless command construction and reporting
 - linked-library population in the binary inspector
 - GNU ELF report loading
 - GUI section filter state
@@ -371,5 +400,6 @@ Not implemented yet:
 
 - symbol rename/comment persistence
 - patching or write-mode analysis
+- deeper Ghidra type/name/decompiler import back into the main analysis views
 
 Those are the natural next steps if the project continues to grow into a broader reverse-engineering workbench.

@@ -77,6 +77,7 @@ from src.disassembler import (
     format_function_decompilation_html,
     format_function_disassembly_html,
 )
+from src.ghidra_toolchain import GhidraHeadlessReport, GhidraInstallation, GhidraToolchain, GhidraToolchainError
 from src.gnu_toolchain import GnuToolchain, GnuToolchainError, SourceLocation, SymbolInfo
 
 HEX_PREVIEW_LIMIT = 8192
@@ -710,6 +711,24 @@ def _binary_report_message(image: BinaryImage | None) -> str:
     return f"Loading {image.file_format} metadata..."
 
 
+def _ghidra_status_message(
+    installation: GhidraInstallation,
+    image: BinaryImage | None,
+    *,
+    running: bool = False,
+) -> str:
+    if not installation.available:
+        return "Ghidra is not installed on this system."
+    version = installation.version or "unknown"
+    if running and image is not None:
+        return f"Running Ghidra {version} headless analysis for {image.path.name}..."
+    if image is None:
+        return f"Ghidra {version} is available. Load a binary to run a headless analysis report."
+    if not installation.headless_available:
+        return f"Ghidra {version} is available, but analyzeHeadless was not found."
+    return f"Ghidra {version} is available for {image.path.name}. Launch the GUI or run a headless analysis report."
+
+
 def _source_lookup_message(image: BinaryImage | None) -> str:
     if image is None:
         return "-"
@@ -932,6 +951,13 @@ class LoadedBinaryReport:
 
 
 @dataclass(frozen=True, slots=True)
+class LoadedGhidraReport:
+    path: Path
+    report: GhidraHeadlessReport | None
+    message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class LoadedAddressMetadata:
     path: Path
     subject: str
@@ -965,6 +991,7 @@ class WorkerSignals(QObject):
     loaded_relocation_xrefs = Signal(object)
     loaded_symbols = Signal(object)
     loaded_binary_report = Signal(object)
+    loaded_ghidra_report = Signal(object)
     loaded_address_metadata = Signal(object)
     error = Signal(object)
 
@@ -1388,6 +1415,25 @@ class BinaryReportWorker(QRunnable):
         _safe_emit(self.signals.loaded_binary_report, LoadedBinaryReport(path=self.path, report=report))
 
 
+class GhidraReportWorker(QRunnable):
+    def __init__(self, path: Path, signals: WorkerSignals) -> None:
+        super().__init__()
+        self.path = path
+        self.signals = signals
+
+    def run(self) -> None:
+        toolchain = GhidraToolchain(self.path)
+        try:
+            report = toolchain.run_headless_analysis()
+        except GhidraToolchainError as exc:
+            _safe_emit(
+                self.signals.loaded_ghidra_report,
+                LoadedGhidraReport(path=self.path, report=None, message=str(exc)),
+            )
+            return
+        _safe_emit(self.signals.loaded_ghidra_report, LoadedGhidraReport(path=self.path, report=report))
+
+
 class AddressMetadataWorker(QRunnable):
     def __init__(
         self,
@@ -1455,6 +1501,7 @@ class MainWindow(QMainWindow):
         self._signals.loaded_relocation_xrefs.connect(self._on_relocation_xrefs_loaded)
         self._signals.loaded_symbols.connect(self._on_symbols_loaded)
         self._signals.loaded_binary_report.connect(self._on_binary_report_loaded)
+        self._signals.loaded_ghidra_report.connect(self._on_ghidra_report_loaded)
         self._signals.loaded_address_metadata.connect(self._on_address_metadata_loaded)
         self._signals.error.connect(self._show_error)
         self._current_path: Path | None = None
@@ -1466,6 +1513,8 @@ class MainWindow(QMainWindow):
         self._relocations: tuple[RelocationInfo, ...] = ()
         self._symbols: tuple[SymbolInfo, ...] = ()
         self._binary_report_text: str = ""
+        self._ghidra_report_text: str = ""
+        self._ghidra_installation = GhidraToolchain.detect_installation()
         self._current_section_disassembly: DisassemblyResult | None = None
         self._current_function_disassembly: FunctionDisassemblyResult | None = None
         self._current_function_decompilation: FunctionDecompilationResult | None = None
@@ -1533,6 +1582,12 @@ class MainWindow(QMainWindow):
         self.run_gdb_action = QAction("Run GDB", self)
         self.run_gdb_action.triggered.connect(self.launch_gdb_terminal)
 
+        self.launch_ghidra_action = QAction("Launch Ghidra", self)
+        self.launch_ghidra_action.triggered.connect(self.launch_ghidra)
+
+        self.run_ghidra_headless_action = QAction("Run Ghidra Headless", self)
+        self.run_ghidra_headless_action.triggered.connect(self.run_ghidra_headless_analysis)
+
         self.light_theme_action = QAction("Light", self)
         self.light_theme_action.setCheckable(True)
         self.light_theme_action.triggered.connect(lambda: self.set_theme(LIGHT_THEME))
@@ -1564,6 +1619,8 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.export_action)
         file_menu.addAction(self.run_codex_action)
         file_menu.addAction(self.run_gdb_action)
+        file_menu.addAction(self.launch_ghidra_action)
+        file_menu.addAction(self.run_ghidra_headless_action)
         file_menu.addSeparator()
         file_menu.addAction(self.exit_action)
 
@@ -1586,6 +1643,8 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.export_action)
         toolbar.addAction(self.run_codex_action)
         toolbar.addAction(self.run_gdb_action)
+        toolbar.addAction(self.launch_ghidra_action)
+        toolbar.addAction(self.run_ghidra_headless_action)
         self.addToolBar(toolbar)
 
     def _build_status_bar(self) -> None:
@@ -1692,6 +1751,9 @@ class MainWindow(QMainWindow):
         self.run_gdb_button = QPushButton("Run GDB")
         self.run_gdb_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.run_gdb_button.clicked.connect(self.launch_gdb_terminal)
+        self.run_ghidra_button = QPushButton("Launch Ghidra")
+        self.run_ghidra_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.run_ghidra_button.clicked.connect(self.launch_ghidra)
         clear_button = QPushButton("Clear")
         clear_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         clear_button.clicked.connect(self._clear_console)
@@ -1702,6 +1764,7 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self.stop_command_button)
         header_row.addWidget(self.run_codex_button)
         header_row.addWidget(self.run_gdb_button)
+        header_row.addWidget(self.run_ghidra_button)
         header_row.addWidget(clear_button)
 
         self.console = QPlainTextEdit(group)
@@ -2577,11 +2640,29 @@ class MainWindow(QMainWindow):
         self.libraries_table.setSortingEnabled(True)
         self.libraries_table.verticalHeader().setVisible(False)
         self.libraries_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.ghidra_summary_label = QLabel(_ghidra_status_message(self._ghidra_installation, None))
+        self.ghidra_summary_label.setProperty("role", "muted")
+        ghidra_action_row = QHBoxLayout()
+        ghidra_action_row.setContentsMargins(0, 0, 0, 0)
+        self.ghidra_launch_button = QPushButton("Launch Ghidra")
+        self.ghidra_launch_button.clicked.connect(self.launch_ghidra)
+        self.ghidra_headless_button = QPushButton("Run Headless Analysis")
+        self.ghidra_headless_button.clicked.connect(self.run_ghidra_headless_analysis)
+        ghidra_action_row.addWidget(self.ghidra_launch_button)
+        ghidra_action_row.addWidget(self.ghidra_headless_button)
+        ghidra_action_row.addStretch(1)
+        self.ghidra_report_view = QPlainTextEdit(parent)
+        self.ghidra_report_view.setReadOnly(True)
+        self.ghidra_report_view.setFont(fixed_font)
+        self.ghidra_report_view.setPlaceholderText("Ghidra headless analysis output will appear here.")
 
         layout.addWidget(self.elf_summary_label)
         layout.addWidget(self.elf_report_view, stretch=2)
         layout.addWidget(self.library_summary_label)
         layout.addWidget(self.libraries_table, stretch=1)
+        layout.addWidget(self.ghidra_summary_label)
+        layout.addLayout(ghidra_action_row)
+        layout.addWidget(self.ghidra_report_view, stretch=1)
         return tab
 
     def open_binary_dialog(self) -> None:
@@ -2609,6 +2690,7 @@ class MainWindow(QMainWindow):
         self._relocations = ()
         self._symbols = ()
         self._binary_report_text = ""
+        self._ghidra_report_text = ""
         self._current_section_disassembly = None
         self._current_function_disassembly = None
         self._current_function_decompilation = None
@@ -2650,6 +2732,8 @@ class MainWindow(QMainWindow):
         self.elf_report_view.setPlainText("")
         self.library_summary_label.setText("Linked libraries will appear here.")
         self.libraries_table.setRowCount(0)
+        self.ghidra_summary_label.setText(_ghidra_status_message(self._ghidra_installation, None))
+        self.ghidra_report_view.setPlainText("")
         self.disassembly_summary.setText(
             f"Previewing up to {DEFAULT_INSTRUCTION_LIMIT} instructions with radare2."
         )
@@ -2683,6 +2767,8 @@ class MainWindow(QMainWindow):
         self._thread_pool.start(SymbolListWorker(self._current_path, self._signals))
         self.elf_summary_label.setText(_binary_report_message(loaded.image))
         self.elf_report_view.setPlainText("")
+        self.ghidra_summary_label.setText(_ghidra_status_message(self._ghidra_installation, loaded.image))
+        self.ghidra_report_view.setPlainText("")
         self._thread_pool.start(BinaryReportWorker(self._current_path, self._signals))
         self._set_status(f"Loaded {loaded.image.path}", 4000)
         self.setWindowTitle(f"{APP_NAME} - {loaded.image.path.name}")
@@ -2899,6 +2985,22 @@ class MainWindow(QMainWindow):
         self._populate_libraries_table(loaded.report.libraries)
         self._set_status("Loaded binary metadata report", 4000)
 
+    def _on_ghidra_report_loaded(self, loaded: LoadedGhidraReport) -> None:
+        if self._current_path != loaded.path:
+            return
+        if loaded.report is None:
+            self._ghidra_report_text = ""
+            self.ghidra_report_view.setPlainText("")
+            self.ghidra_summary_label.setText(
+                loaded.message or _ghidra_status_message(self._ghidra_installation, self._current_image)
+            )
+            self._set_status(loaded.message or "Ghidra headless analysis failed.", 5000)
+            return
+        self._ghidra_report_text = loaded.report.text
+        self.ghidra_summary_label.setText(loaded.report.summary)
+        self.ghidra_report_view.setPlainText(loaded.report.text)
+        self._set_status("Loaded Ghidra headless analysis report", 5000)
+
     def _on_address_metadata_loaded(self, loaded: LoadedAddressMetadata) -> None:
         if self._current_path != loaded.path:
             return
@@ -2954,6 +3056,14 @@ class MainWindow(QMainWindow):
         self.run_codex_action.setEnabled(_terminal_command() is not None and shutil.which("codex") is not None)
         self.run_gdb_action.setEnabled(
             loaded and self._current_path is not None and _terminal_command() is not None and GnuToolchain.has_gdb()
+        )
+        self.launch_ghidra_action.setEnabled(self._ghidra_installation.available)
+        self.run_ghidra_headless_action.setEnabled(
+            loaded and self._current_path is not None and self._ghidra_installation.headless_available
+        )
+        self.ghidra_launch_button.setEnabled(self._ghidra_installation.available)
+        self.ghidra_headless_button.setEnabled(
+            loaded and self._current_path is not None and self._ghidra_installation.headless_available
         )
 
     def _apply_default_splitter_layout(self) -> None:
@@ -4290,6 +4400,7 @@ class MainWindow(QMainWindow):
         self.run_gdb_button.setEnabled(
             self._current_path is not None and _terminal_command() is not None and GnuToolchain.has_gdb()
         )
+        self.run_ghidra_button.setEnabled(self._ghidra_installation.available)
 
     def execute_console_command(self) -> None:
         command = self.command_input.text().strip()
@@ -4360,6 +4471,38 @@ class MainWindow(QMainWindow):
             workdir=workdir,
             success_message=f"Launched gdb for {self._current_path.name} in external terminal",
         )
+
+    def launch_ghidra(self) -> None:
+        ghidra_path = self._ghidra_installation.ghidra_path
+        if ghidra_path is None:
+            self._set_status("Ghidra is not available on this system.", 6000)
+            return
+        workdir = self._console_workdir()
+        ok, _pid = QProcess.startDetached(str(ghidra_path), [], str(workdir))
+        if not ok:
+            self._set_status("Failed to launch Ghidra.", 6000)
+            return
+        if self._current_path is not None:
+            self._set_status(
+                f"Launched Ghidra GUI. Import {self._current_path.name} there, or use Run Ghidra Headless for an in-app report.",
+                6000,
+            )
+            return
+        self._set_status("Launched Ghidra GUI.", 5000)
+
+    def run_ghidra_headless_analysis(self) -> None:
+        if self._current_path is None:
+            self._set_status("Load a binary before running Ghidra headless analysis.", 6000)
+            return
+        if not self._ghidra_installation.headless_available:
+            self._set_status("Ghidra analyzeHeadless is not available on this system.", 6000)
+            return
+        self.ghidra_summary_label.setText(
+            _ghidra_status_message(self._ghidra_installation, self._current_image, running=True)
+        )
+        self.ghidra_report_view.setPlainText("")
+        self._set_status(f"Running Ghidra headless analysis for {self._current_path.name}...")
+        self._thread_pool.start(GhidraReportWorker(self._current_path, self._signals))
 
     def _launch_external_terminal(self, command: list[str], *, workdir: Path, success_message: str) -> None:
         terminal = _terminal_command()
