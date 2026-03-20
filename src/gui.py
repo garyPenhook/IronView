@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import quote, unquote
 
 from PySide6.QtCore import QObject, QPointF, QProcess, QRunnable, Qt, QThreadPool, QUrl, Signal
 from PySide6.QtGui import (
@@ -22,6 +24,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGraphicsRectItem,
@@ -56,6 +60,7 @@ from src.disassembler import (
     ControlFlowBlock,
     ControlFlowEdge,
     DEFAULT_INSTRUCTION_LIMIT,
+    DecompilationInlineLink,
     DisassemblyResult,
     ExportInfo,
     FunctionDecompilationResult,
@@ -69,6 +74,7 @@ from src.disassembler import (
     StringInfo,
     XrefInfo,
     format_disassembly_html,
+    format_function_decompilation_html,
     format_function_disassembly_html,
 )
 from src.gnu_toolchain import GnuToolchain, GnuToolchainError, SourceLocation, SymbolInfo
@@ -133,6 +139,17 @@ XREF_COLUMNS = (
     "Type",
     "Opcode",
 )
+HLL_CONTEXT_COLUMNS = (
+    "Kind",
+    "Name",
+    "Target",
+)
+HLL_CALL_COLUMNS = (
+    "Kind",
+    "Name",
+    "Calls",
+    "Target",
+)
 APP_NAME = "IronView"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WORKDIR = PROJECT_ROOT
@@ -144,6 +161,13 @@ def _format_int(value: int) -> str:
 
 def _format_hex(value: int) -> str:
     return f"0x{value:X}"
+
+
+def _parse_hex_payload(value: str) -> int | None:
+    try:
+        return int(value, 16)
+    except ValueError:
+        return None
 
 
 def _format_preview(data: bytes, *, max_bytes: int = HEX_PREVIEW_LIMIT) -> str:
@@ -262,6 +286,397 @@ def _matches_relocation_filter(relocation: RelocationInfo, query: str) -> bool:
         "ifunc" if relocation.is_ifunc else "regular",
     )
     return any(normalized in value.lower() for value in haystacks)
+
+
+@dataclass(frozen=True, slots=True)
+class HllContextItem:
+    kind: str
+    name: str
+    detail: str
+    address: int = 0
+    match_names: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class HllCallItem:
+    kind: str
+    name: str
+    count: int
+    detail: str
+    address: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class HllDeclarationSummary:
+    arguments: tuple[str, ...]
+    locals: tuple[str, ...]
+
+
+def _decompilation_aliases(name: str) -> tuple[str, ...]:
+    stripped_import = (
+        name.removeprefix("sym.imp.").removeprefix("imp.").removeprefix("import.").strip()
+    )
+    candidates = {
+        name.strip(),
+        _normalized_lookup_name(name),
+        name.removeprefix("sym.").strip(),
+        name.removeprefix("sym.imp.").strip(),
+        name.removeprefix("imp.").strip(),
+        name.removeprefix("import.").strip(),
+        name.removeprefix("reloc.").strip(),
+        f"import.{stripped_import}" if stripped_import else "",
+    }
+    aliases = {
+        candidate.lower()
+        for candidate in candidates
+        if isinstance(candidate, str) and candidate and len(candidate.strip()) >= 4
+    }
+    return tuple(sorted(aliases))
+
+
+def _text_mentions_alias(text: str, aliases: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    for alias in aliases:
+        pattern = rf"(?<![A-Za-z0-9_]){re.escape(alias)}(?![A-Za-z0-9_])"
+        if re.search(pattern, lowered):
+            return True
+    return False
+
+
+def _correlate_function_decompilation_context(
+    result: FunctionDecompilationResult,
+    *,
+    functions: Sequence[FunctionInfo],
+    imports: Sequence[ImportInfo],
+    strings: Sequence[StringInfo],
+    symbols: Sequence[SymbolInfo],
+) -> tuple[HllContextItem, ...]:
+    text = result.text
+    contexts: list[HllContextItem] = []
+    seen: set[tuple[str, str, int]] = set()
+
+    def add_context(item: HllContextItem) -> None:
+        key = (item.kind, item.name, item.address)
+        if key in seen:
+            return
+        seen.add(key)
+        contexts.append(item)
+
+    for function in functions:
+        if function.address == result.function.address:
+            continue
+        if _text_mentions_alias(text, _decompilation_aliases(function.name)):
+            add_context(
+                HllContextItem(
+                    kind="Function",
+                    name=function.name,
+                    detail=_format_hex(function.address),
+                    address=function.address,
+                    match_names=_decompilation_aliases(function.name),
+                )
+            )
+
+    for imp in imports:
+        if _text_mentions_alias(text, _decompilation_aliases(imp.name)):
+            target = _format_hex(imp.plt_address) if imp.plt_address > 0 else imp.kind
+            add_context(
+                HllContextItem(
+                    kind="Import",
+                    name=imp.name,
+                    detail=target,
+                    address=imp.plt_address,
+                    match_names=tuple(
+                        sorted(
+                            set(_decompilation_aliases(imp.name))
+                            | set(_decompilation_aliases(f"sym.imp.{imp.name}"))
+                        )
+                    ),
+                )
+            )
+
+    for string in strings:
+        if len(string.value) < 4:
+            continue
+        if string.value in text:
+            add_context(
+                HllContextItem(
+                    kind="String",
+                    name=string.value,
+                    detail=_format_hex(string.address),
+                    address=string.address,
+                    match_names=(string.value,),
+                )
+            )
+
+    for symbol in symbols:
+        if _text_mentions_alias(
+            text,
+            tuple(
+                sorted(
+                    set(_decompilation_aliases(symbol.name))
+                    | set(_decompilation_aliases(symbol.demangled_name))
+                )
+            ),
+        ):
+            add_context(
+                HllContextItem(
+                    kind="Symbol",
+                    name=symbol.demangled_name or symbol.name,
+                    detail=_format_hex(symbol.address),
+                    address=symbol.address,
+                    match_names=tuple(
+                        sorted(
+                            set(_decompilation_aliases(symbol.name))
+                            | set(_decompilation_aliases(symbol.demangled_name))
+                        )
+                    ),
+                )
+            )
+
+    kind_order = {"Function": 0, "Import": 1, "String": 2, "Symbol": 3}
+    return tuple(sorted(contexts, key=lambda item: (kind_order.get(item.kind, 9), item.name.lower(), item.address)))
+
+
+def _hll_context_href(context: HllContextItem) -> str:
+    if context.kind == "Import":
+        return f"ctx://import/{quote(context.name)}"
+    if context.kind == "String":
+        payload = _format_hex(context.address) if context.address > 0 else context.name
+        return f"ctx://string/{quote(payload)}"
+    if context.kind == "Symbol":
+        payload = _format_hex(context.address) if context.address > 0 else context.name
+        return f"ctx://symbol/{quote(payload)}"
+    payload = _format_hex(context.address) if context.address > 0 else context.name
+    return f"ctx://function/{quote(payload)}"
+
+
+def _build_hll_inline_links(contexts: Sequence[HllContextItem]) -> tuple[DecompilationInlineLink, ...]:
+    links: list[DecompilationInlineLink] = []
+    seen: set[tuple[str, str]] = set()
+    for context in contexts:
+        href = _hll_context_href(context)
+        for match_name in context.match_names or (context.name,):
+            token = match_name.strip()
+            if len(token) < 2:
+                continue
+            key = (token, href)
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(
+                DecompilationInlineLink(
+                    match_text=token,
+                    href=href,
+                    title=f"{context.kind}: {context.name}",
+                )
+            )
+    return tuple(links)
+
+
+def _structured_names(
+    raw_decompilation: dict[str, object] | None,
+    keys: Sequence[str],
+) -> tuple[str, ...]:
+    if not isinstance(raw_decompilation, dict):
+        return ()
+    names: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        raw_value = raw_decompilation.get(key)
+        if not isinstance(raw_value, list):
+            continue
+        for item in raw_value:
+            name: str | None = None
+            if isinstance(item, str):
+                name = item.strip()
+            elif isinstance(item, dict):
+                for candidate_key in ("name", "var", "arg", "value", "id"):
+                    candidate = item.get(candidate_key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        name = candidate.strip()
+                        break
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+    return tuple(names)
+
+
+def _parse_decompilation_arguments(result: FunctionDecompilationResult) -> tuple[str, ...]:
+    structured = _structured_names(result.raw_json, ("args", "arguments", "params", "parameters"))
+    if structured:
+        return structured
+    signature = result.function.signature.strip()
+    if not signature:
+        first_line = next((line.strip() for line in result.text.splitlines() if "(" in line and ")" in line), "")
+        signature = first_line
+    match = re.search(r"\((.*)\)", signature)
+    if match is None:
+        return ()
+    raw_args = match.group(1).strip()
+    if not raw_args or raw_args == "void":
+        return ()
+    arguments: list[str] = []
+    for part in raw_args.split(","):
+        candidate = part.strip()
+        if not candidate:
+            continue
+        if candidate == "...":
+            arguments.append("...")
+            continue
+        name_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[\])?$", candidate)
+        if name_match is None:
+            continue
+        name = name_match.group(1)
+        if name not in arguments:
+            arguments.append(name)
+    return tuple(arguments)
+
+
+def _parse_decompilation_locals(result: FunctionDecompilationResult) -> tuple[str, ...]:
+    structured = _structured_names(result.raw_json, ("locals", "vars", "variables", "localvars"))
+    if structured:
+        argument_names = set(_parse_decompilation_arguments(result))
+        return tuple(name for name in structured if name not in argument_names)
+    locals_found: list[str] = []
+    seen: set[str] = set()
+    argument_names = set(_parse_decompilation_arguments(result))
+    declaration_pattern = re.compile(
+        r"^\s*(?:const\s+)?(?:unsigned\s+|signed\s+|volatile\s+|static\s+|struct\s+)*"
+        r"(?:[A-Za-z_][A-Za-z0-9_:<>]*[\s\*]+)+([A-Za-z_][A-Za-z0-9_]*)\s*(?:[=;\[,])"
+    )
+    for line in result.text.splitlines()[1:]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        match = declaration_pattern.match(stripped)
+        if match is None:
+            continue
+        name = match.group(1)
+        if name in argument_names or name in seen:
+            continue
+        seen.add(name)
+        locals_found.append(name)
+    return tuple(locals_found)
+
+
+def _extract_hll_calls(
+    result: FunctionDecompilationResult,
+    *,
+    contexts: Sequence[HllContextItem],
+) -> tuple[HllCallItem, ...]:
+    structured_calls = _extract_structured_hll_calls(result, contexts=contexts)
+    if structured_calls:
+        return structured_calls
+    counts: dict[tuple[str, str, int], HllCallItem] = {}
+    context_aliases: list[tuple[HllContextItem, set[str]]] = [
+        (context, {alias.lower() for alias in context.match_names or (context.name,) if alias})
+        for context in contexts
+    ]
+    current_function_aliases = {alias.lower() for alias in _decompilation_aliases(result.function.name)}
+    call_pattern = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_:.]*)\s*\(")
+    ignored = {"if", "for", "while", "switch", "return", "sizeof", "catch"}
+    for line in result.text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        for match in call_pattern.finditer(line):
+            token = match.group(1)
+            normalized = token.lower()
+            if normalized in ignored or normalized in current_function_aliases:
+                continue
+            matched_context = next(
+                (context for context, aliases in context_aliases if normalized in aliases and context.kind != "String"),
+                None,
+            )
+            if matched_context is not None:
+                kind = matched_context.kind
+                name = matched_context.name
+                detail = matched_context.detail
+                address = matched_context.address
+            else:
+                kind = "Call"
+                name = token
+                detail = "-"
+                address = 0
+            key = (kind, name, address)
+            existing = counts.get(key)
+            if existing is None:
+                counts[key] = HllCallItem(kind=kind, name=name, count=1, detail=detail, address=address)
+            else:
+                counts[key] = HllCallItem(
+                    kind=existing.kind,
+                    name=existing.name,
+                    count=existing.count + 1,
+                    detail=existing.detail,
+                    address=existing.address,
+                )
+    kind_order = {"Import": 0, "Function": 1, "Symbol": 2, "Call": 3}
+    return tuple(sorted(counts.values(), key=lambda item: (kind_order.get(item.kind, 9), item.name.lower(), item.address)))
+
+
+def _extract_structured_hll_calls(
+    result: FunctionDecompilationResult,
+    *,
+    contexts: Sequence[HllContextItem],
+) -> tuple[HllCallItem, ...]:
+    raw_decompilation = result.raw_json
+    if not isinstance(raw_decompilation, dict):
+        return ()
+    raw_calls = None
+    for key in ("calls", "callrefs", "callees"):
+        candidate = raw_decompilation.get(key)
+        if isinstance(candidate, list):
+            raw_calls = candidate
+            break
+    if raw_calls is None:
+        return ()
+    context_by_alias: dict[str, HllContextItem] = {}
+    for context in contexts:
+        for alias in context.match_names or (context.name,):
+            if alias:
+                context_by_alias.setdefault(alias.lower(), context)
+    summarized: dict[tuple[str, str, int], HllCallItem] = {}
+    for item in raw_calls:
+        if not isinstance(item, dict):
+            continue
+        raw_name = None
+        for key in ("name", "callee", "target", "sym"):
+            candidate = item.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                raw_name = candidate.strip()
+                break
+        if raw_name is None:
+            continue
+        normalized = raw_name.lower()
+        context = context_by_alias.get(normalized)
+        count_value = item.get("count")
+        count = count_value if isinstance(count_value, int) and count_value > 0 else 1
+        if context is not None and context.kind != "String":
+            kind = context.kind
+            name = context.name
+            detail = context.detail
+            address = context.address
+        else:
+            kind_value = item.get("kind") or item.get("type")
+            kind = kind_value if isinstance(kind_value, str) and kind_value else "Call"
+            name = raw_name
+            detail = "-"
+            address = 0
+        key = (kind, name, address)
+        existing = summarized.get(key)
+        if existing is None:
+            summarized[key] = HllCallItem(kind=kind, name=name, count=count, detail=detail, address=address)
+        else:
+            summarized[key] = HllCallItem(
+                kind=existing.kind,
+                name=existing.name,
+                count=existing.count + count,
+                detail=existing.detail,
+                address=existing.address,
+            )
+    kind_order = {"Import": 0, "Function": 1, "Symbol": 2, "Call": 3}
+    return tuple(sorted(summarized.values(), key=lambda item: (kind_order.get(item.kind, 9), item.name.lower(), item.address)))
 
 
 def _build_export_path(binary_path: Path, section_name: str) -> Path:
@@ -438,6 +853,7 @@ class LoadedFunctionDisassembly:
 class LoadedFunctionDecompilation:
     path: Path
     function_address: int
+    requested_backend: str | None
     result: FunctionDecompilationResult | None
     message: str = ""
 
@@ -713,22 +1129,31 @@ class FunctionDisassemblyWorker(QRunnable):
 
 
 class FunctionDecompilationWorker(QRunnable):
-    def __init__(self, path: Path, function: FunctionInfo, signals: WorkerSignals) -> None:
+    def __init__(
+        self,
+        path: Path,
+        function: FunctionInfo,
+        signals: WorkerSignals,
+        *,
+        backend: str | None = None,
+    ) -> None:
         super().__init__()
         self.path = path
         self.function = function
         self.signals = signals
+        self.backend = backend
 
     def run(self) -> None:
         try:
             with Radare2Disassembler(self.path) as disassembler:
-                result = disassembler.decompile_function(self.function)
+                result = disassembler.decompile_function(self.function, backend=self.backend)
         except Radare2DisassemblerError as exc:
             _safe_emit(
                 self.signals.loaded_function_decompilation,
                 LoadedFunctionDecompilation(
                     path=self.path,
                     function_address=self.function.address,
+                    requested_backend=self.backend,
                     result=None,
                     message=str(exc),
                 ),
@@ -739,6 +1164,7 @@ class FunctionDecompilationWorker(QRunnable):
             LoadedFunctionDecompilation(
                 path=self.path,
                 function_address=self.function.address,
+                requested_backend=self.backend,
                 result=result,
             ),
         )
@@ -1043,6 +1469,8 @@ class MainWindow(QMainWindow):
         self._current_section_disassembly: DisassemblyResult | None = None
         self._current_function_disassembly: FunctionDisassemblyResult | None = None
         self._current_function_decompilation: FunctionDecompilationResult | None = None
+        self._current_function_decompilation_contexts: tuple[HllContextItem, ...] = ()
+        self._current_function_decompilation_calls: tuple[HllCallItem, ...] = ()
         self._current_function_graph: FunctionGraphResult | None = None
         self._pending_function_scroll_address: int | None = None
         self._selected_section: str | None = None
@@ -1060,6 +1488,8 @@ class MainWindow(QMainWindow):
         self._selected_cfg_block_address: int | None = None
         self._loading_image = False
         self._theme = LIGHT_THEME
+        self._browser_splitter_sizes: list[int] | None = None
+        self._console_splitter_sizes: list[int] | None = None
         self._command_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self._command_process.readyReadStandardOutput.connect(self._append_command_output)
         self._command_process.finished.connect(self._on_command_finished)
@@ -1111,6 +1541,16 @@ class MainWindow(QMainWindow):
         self.dark_theme_action.setCheckable(True)
         self.dark_theme_action.triggered.connect(lambda: self.set_theme(DARK_THEME))
 
+        self.toggle_browser_action = QAction("Show Browser", self)
+        self.toggle_browser_action.setCheckable(True)
+        self.toggle_browser_action.setChecked(True)
+        self.toggle_browser_action.triggered.connect(self._toggle_browser_pane)
+
+        self.toggle_console_action = QAction("Show Console", self)
+        self.toggle_console_action.setCheckable(True)
+        self.toggle_console_action.setChecked(True)
+        self.toggle_console_action.triggered.connect(self._toggle_console_pane)
+
         self.theme_action_group = QActionGroup(self)
         self.theme_action_group.setExclusive(True)
         self.theme_action_group.addAction(self.light_theme_action)
@@ -1128,6 +1568,9 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.exit_action)
 
         view_menu = self.menuBar().addMenu("View")
+        view_menu.addAction(self.toggle_browser_action)
+        view_menu.addAction(self.toggle_console_action)
+        view_menu.addSeparator()
         theme_menu = view_menu.addMenu("Theme")
         theme_menu.addAction(self.light_theme_action)
         theme_menu.addAction(self.dark_theme_action)
@@ -1196,28 +1639,33 @@ class MainWindow(QMainWindow):
         summary_layout.addRow("Architecture", self.arch_value)
         summary_layout.addRow("Sections", self.section_count_value)
 
-        left_splitter = QSplitter(Qt.Orientation.Vertical, self)
-        left_splitter.addWidget(self._build_sections_group())
-        left_splitter.addWidget(self._build_browser_group())
-        left_splitter.setStretchFactor(0, 3)
-        left_splitter.setStretchFactor(1, 2)
+        self.sections_group = self._build_sections_group()
+        self.browser_group = self._build_browser_group()
+        self.left_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self.left_splitter.addWidget(self.sections_group)
+        self.left_splitter.addWidget(self.browser_group)
+        self.left_splitter.setStretchFactor(0, 3)
+        self.left_splitter.setStretchFactor(1, 2)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        splitter.addWidget(left_splitter)
-        splitter.addWidget(self._build_details_group())
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        self.details_group = self._build_details_group()
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.main_splitter.addWidget(self.left_splitter)
+        self.main_splitter.addWidget(self.details_group)
+        self.main_splitter.setStretchFactor(0, 2)
+        self.main_splitter.setStretchFactor(1, 3)
 
-        body_splitter = QSplitter(Qt.Orientation.Vertical, self)
-        body_splitter.addWidget(splitter)
-        body_splitter.addWidget(self._build_console_group())
-        body_splitter.setStretchFactor(0, 6)
-        body_splitter.setStretchFactor(1, 2)
+        self.console_group = self._build_console_group()
+        self.body_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self.body_splitter.addWidget(self.main_splitter)
+        self.body_splitter.addWidget(self.console_group)
+        self.body_splitter.setStretchFactor(0, 7)
+        self.body_splitter.setStretchFactor(1, 2)
 
         root_layout.addLayout(header_row)
         root_layout.addWidget(summary_group)
-        root_layout.addWidget(body_splitter, stretch=1)
+        root_layout.addWidget(self.body_splitter, stretch=1)
         self.setCentralWidget(root)
+        self._apply_default_splitter_layout()
         self._log_message("Application ready.")
 
     def _build_console_group(self) -> QWidget:
@@ -1691,12 +2139,78 @@ class MainWindow(QMainWindow):
             "Select a radare2 function to preview its HLL-style decompilation."
         )
         self.function_decompilation_summary.setProperty("role", "muted")
-        self.function_decompilation_preview = QPlainTextEdit(parent)
+        self.function_decompilation_backend_selector = QComboBox(parent)
+        self.function_decompilation_backend_selector.addItem("Auto (Best Available)", None)
+        self.function_decompilation_backend_selector.addItem("r2ghidra (pdg)", "pdg")
+        self.function_decompilation_backend_selector.addItem("r2dec (pdd)", "pdd")
+        self.function_decompilation_backend_selector.addItem("radare2 pseudo (pdc)", "pdc")
+        self.function_decompilation_backend_selector.currentIndexChanged.connect(
+            self._on_function_decompilation_backend_changed
+        )
+        self.function_decompilation_reload_button = QPushButton("Reload HLL", parent)
+        self.function_decompilation_reload_button.clicked.connect(self._reload_selected_function_decompilation)
+        self.function_decompilation_clean_toggle = QCheckBox("Clean HLL", parent)
+        self.function_decompilation_clean_toggle.setChecked(True)
+        self.function_decompilation_clean_toggle.toggled.connect(self._refresh_function_decompilation_insights)
+        self.function_decompilation_active_backend_value = QLabel("auto")
+        self.function_decompilation_available_backends_value = QLabel("-")
+        self.function_decompilation_warning_value = QLabel("-")
+        self.function_decompilation_declarations_value = QLabel("-")
+        self.function_decompilation_declarations_value.setWordWrap(True)
+        self.function_decompilation_declarations_value.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.function_decompilation_calls_summary = QLabel("Calls update when HLL results load.")
+        self.function_decompilation_calls_summary.setProperty("role", "muted")
+        self.function_decompilation_context_summary = QLabel("Context updates when HLL results load.")
+        self.function_decompilation_context_summary.setProperty("role", "muted")
+        for label in (
+            self.function_decompilation_active_backend_value,
+            self.function_decompilation_available_backends_value,
+            self.function_decompilation_warning_value,
+        ):
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.function_decompilation_context_table = QTableWidget(0, len(HLL_CONTEXT_COLUMNS), parent)
+        self.function_decompilation_context_table.setHorizontalHeaderLabels(HLL_CONTEXT_COLUMNS)
+        self.function_decompilation_context_table.setAlternatingRowColors(True)
+        self.function_decompilation_context_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.function_decompilation_context_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.function_decompilation_context_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.function_decompilation_context_table.setSortingEnabled(True)
+        self.function_decompilation_context_table.verticalHeader().setVisible(False)
+        self.function_decompilation_context_table.itemDoubleClicked.connect(
+            self._navigate_selected_function_decompilation_context
+        )
+        context_header = self.function_decompilation_context_table.horizontalHeader()
+        context_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        context_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        context_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        context_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.function_decompilation_calls_table = QTableWidget(0, len(HLL_CALL_COLUMNS), parent)
+        self.function_decompilation_calls_table.setHorizontalHeaderLabels(HLL_CALL_COLUMNS)
+        self.function_decompilation_calls_table.setAlternatingRowColors(True)
+        self.function_decompilation_calls_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.function_decompilation_calls_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.function_decompilation_calls_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.function_decompilation_calls_table.setSortingEnabled(True)
+        self.function_decompilation_calls_table.verticalHeader().setVisible(False)
+        self.function_decompilation_calls_table.itemDoubleClicked.connect(
+            self._navigate_selected_function_decompilation_call
+        )
+        call_header = self.function_decompilation_calls_table.horizontalHeader()
+        call_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        call_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        call_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        call_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        call_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.function_decompilation_preview = QTextBrowser(parent)
         self.function_decompilation_preview.setReadOnly(True)
         self.function_decompilation_preview.setFont(fixed_font)
-        self.function_decompilation_preview.setPlaceholderText(
-            "Select a function from the radare2 browser to preview its decompilation."
-        )
+        self.function_decompilation_preview.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.function_decompilation_preview.setOpenExternalLinks(False)
+        self.function_decompilation_preview.setOpenLinks(False)
+        self.function_decompilation_preview.anchorClicked.connect(self._navigate_function_decompilation_target)
 
         disassembly_tab = QWidget(parent)
         disassembly_layout = QVBoxLayout(disassembly_tab)
@@ -1709,8 +2223,49 @@ class MainWindow(QMainWindow):
         decompilation_layout = QVBoxLayout(decompilation_tab)
         decompilation_layout.setContentsMargins(0, 0, 0, 0)
         decompilation_layout.setSpacing(8)
+        decompilation_controls = QHBoxLayout()
+        decompilation_controls.setContentsMargins(0, 0, 0, 0)
+        decompilation_controls.addWidget(QLabel("Backend", parent))
+        decompilation_controls.addWidget(self.function_decompilation_backend_selector)
+        decompilation_controls.addWidget(self.function_decompilation_reload_button)
+        decompilation_controls.addWidget(self.function_decompilation_clean_toggle)
+        decompilation_controls.addStretch(1)
+        decompilation_status_form = QFormLayout()
+        decompilation_status_form.addRow("Active Backend", self.function_decompilation_active_backend_value)
+        decompilation_status_form.addRow("Available", self.function_decompilation_available_backends_value)
+        decompilation_status_form.addRow("Warnings", self.function_decompilation_warning_value)
+        decompilation_status_form.addRow("Declarations", self.function_decompilation_declarations_value)
+        decompilation_overview_tab = QWidget(parent)
+        decompilation_overview_layout = QVBoxLayout(decompilation_overview_tab)
+        decompilation_overview_layout.setContentsMargins(0, 0, 0, 0)
+        decompilation_overview_layout.setSpacing(8)
+        decompilation_overview_layout.addLayout(decompilation_status_form)
+        decompilation_overview_layout.addStretch(1)
+        decompilation_calls_tab = QWidget(parent)
+        decompilation_calls_layout = QVBoxLayout(decompilation_calls_tab)
+        decompilation_calls_layout.setContentsMargins(0, 0, 0, 0)
+        decompilation_calls_layout.setSpacing(8)
+        decompilation_calls_layout.addWidget(self.function_decompilation_calls_summary)
+        decompilation_calls_layout.addWidget(self.function_decompilation_calls_table, stretch=1)
+        decompilation_context_tab = QWidget(parent)
+        decompilation_context_layout = QVBoxLayout(decompilation_context_tab)
+        decompilation_context_layout.setContentsMargins(0, 0, 0, 0)
+        decompilation_context_layout.setSpacing(8)
+        decompilation_context_layout.addWidget(self.function_decompilation_context_summary)
+        decompilation_context_layout.addWidget(self.function_decompilation_context_table, stretch=1)
+        self.function_decompilation_insights_tabs = QTabWidget(parent)
+        self.function_decompilation_insights_tabs.addTab(decompilation_overview_tab, "Overview")
+        self.function_decompilation_insights_tabs.addTab(decompilation_calls_tab, "Calls")
+        self.function_decompilation_insights_tabs.addTab(decompilation_context_tab, "Context")
+        self.function_decompilation_insights_tabs.setDocumentMode(True)
+        self.function_decompilation_splitter = QSplitter(Qt.Orientation.Vertical, parent)
+        self.function_decompilation_splitter.addWidget(self.function_decompilation_preview)
+        self.function_decompilation_splitter.addWidget(self.function_decompilation_insights_tabs)
+        self.function_decompilation_splitter.setStretchFactor(0, 5)
+        self.function_decompilation_splitter.setStretchFactor(1, 3)
+        decompilation_layout.addLayout(decompilation_controls)
         decompilation_layout.addWidget(self.function_decompilation_summary)
-        decompilation_layout.addWidget(self.function_decompilation_preview, stretch=1)
+        decompilation_layout.addWidget(self.function_decompilation_splitter, stretch=1)
 
         self.function_cfg_summary = QLabel("Select a radare2 function to preview its control-flow graph.")
         self.function_cfg_summary.setProperty("role", "muted")
@@ -2164,6 +2719,7 @@ class MainWindow(QMainWindow):
         self._functions = loaded.functions
         self._populate_functions_table(loaded.functions)
         self._apply_function_filter(self.function_filter_input.text())
+        self._refresh_function_decompilation_contexts()
         self._set_status(f"Loaded {len(loaded.functions):,} radare2 functions", 4000)
 
     def _on_function_disassembly_loaded(self, loaded: LoadedFunctionDisassembly) -> None:
@@ -2191,14 +2747,31 @@ class MainWindow(QMainWindow):
     def _on_function_decompilation_loaded(self, loaded: LoadedFunctionDecompilation) -> None:
         if self._current_path != loaded.path or self._selected_function_address != loaded.function_address:
             return
+        if self._selected_decompilation_backend() != loaded.requested_backend:
+            return
         if loaded.result is None:
             self._current_function_decompilation = None
             self.function_decompilation_summary.setText(loaded.message)
-            self.function_decompilation_preview.setPlainText("")
+            self._clear_function_decompilation_status()
+            self._current_function_decompilation_contexts = ()
+            self._current_function_decompilation_calls = ()
+            self._populate_function_decompilation_call_table(())
+            self.function_decompilation_calls_summary.setText("No HLL call summary is available.")
+            self._populate_function_decompilation_context_table(())
+            self.function_decompilation_context_summary.setText("No HLL context is available.")
+            self.function_decompilation_preview.setHtml("")
             self._set_status(loaded.message, 4000)
             return
         function = loaded.result.function
         self._current_function_decompilation = loaded.result
+        contexts = _correlate_function_decompilation_context(
+            loaded.result,
+            functions=self._functions,
+            imports=self._imports,
+            strings=self._strings,
+            symbols=self._symbols,
+        )
+        self._current_function_decompilation_contexts = contexts
         summary_parts = [
             f"{loaded.result.backend_display_name or loaded.result.backend} HLL-style decompilation for {function.name} at {_format_hex(function.address)}."
         ]
@@ -2209,7 +2782,8 @@ class MainWindow(QMainWindow):
         if loaded.result.warnings:
             summary_parts.append(loaded.result.warnings[0])
         self.function_decompilation_summary.setText(" ".join(summary_parts))
-        self.function_decompilation_preview.setPlainText(loaded.result.text)
+        self._update_function_decompilation_status(loaded.result)
+        self._refresh_function_decompilation_insights()
         self._set_status(f"Loaded HLL view for {function.name}", 4000)
 
     def _on_function_graph_loaded(self, loaded: LoadedFunctionGraph) -> None:
@@ -2240,6 +2814,7 @@ class MainWindow(QMainWindow):
         self._strings = loaded.strings
         self._populate_strings_table(loaded.strings)
         self._apply_string_filter(self.string_filter_input.text())
+        self._refresh_function_decompilation_contexts()
         self._set_status(f"Loaded {len(loaded.strings):,} radare2 strings", 4000)
 
     def _on_xrefs_loaded(self, loaded: LoadedXrefs) -> None:
@@ -2255,6 +2830,7 @@ class MainWindow(QMainWindow):
         self._imports = loaded.imports
         self._populate_imports_table(loaded.imports)
         self._apply_import_filter(self.import_filter_input.text())
+        self._refresh_function_decompilation_contexts()
         self._set_status(f"Loaded {len(loaded.imports):,} radare2 imports", 4000)
 
     def _on_exports_loaded(self, loaded: LoadedExports) -> None:
@@ -2303,6 +2879,7 @@ class MainWindow(QMainWindow):
         self._symbols = loaded.symbols
         self._populate_symbols_table(loaded.symbols)
         self._apply_symbol_filter(self.symbol_filter_input.text())
+        self._refresh_function_decompilation_contexts()
         self._set_status(f"Loaded {len(loaded.symbols):,} radare2 symbols", 4000)
 
     def _on_binary_report_loaded(self, loaded: LoadedBinaryReport) -> None:
@@ -2378,6 +2955,37 @@ class MainWindow(QMainWindow):
         self.run_gdb_action.setEnabled(
             loaded and self._current_path is not None and _terminal_command() is not None and GnuToolchain.has_gdb()
         )
+
+    def _apply_default_splitter_layout(self) -> None:
+        self.left_splitter.setSizes([360, 280])
+        self.main_splitter.setSizes([460, 900])
+        self.body_splitter.setSizes([720, 180])
+
+    def _toggle_browser_pane(self, checked: bool) -> None:
+        current_sizes = self.left_splitter.sizes()
+        if checked:
+            target_sizes = self._browser_splitter_sizes or [360, 280]
+            self.left_splitter.setSizes(target_sizes)
+            self._set_status("Browser pane restored.", 2500)
+            return
+        if len(current_sizes) >= 2 and current_sizes[1] > 0:
+            self._browser_splitter_sizes = current_sizes
+        total = max(sum(current_sizes), 1)
+        self.left_splitter.setSizes([total, 0])
+        self._set_status("Browser pane collapsed.", 2500)
+
+    def _toggle_console_pane(self, checked: bool) -> None:
+        current_sizes = self.body_splitter.sizes()
+        if checked:
+            target_sizes = self._console_splitter_sizes or [720, 180]
+            self.body_splitter.setSizes(target_sizes)
+            self._set_status("Console restored.", 2500)
+            return
+        if len(current_sizes) >= 2 and current_sizes[1] > 0:
+            self._console_splitter_sizes = current_sizes
+        total = max(sum(current_sizes), 1)
+        self.body_splitter.setSizes([total, 0])
+        self._set_status("Console collapsed.", 2500)
 
     def _populate_sections_table(self, sections: tuple[SectionInfo, ...]) -> None:
         self.sections_table.setSortingEnabled(False)
@@ -2739,23 +3347,65 @@ class MainWindow(QMainWindow):
         self._thread_pool.start(SectionLoadWorker(self._current_path, section.name, self._signals))
         self._thread_pool.start(DisassemblyLoadWorker(self._current_path, section, self._signals))
 
-    def _on_function_selection_changed(self) -> None:
+    def _selected_function(self) -> FunctionInfo | None:
         selected_items = self.functions_table.selectedItems()
-        if not selected_items or self._current_path is None or self._loading_image:
-            return
+        if not selected_items:
+            return None
         function = selected_items[0].data(Qt.ItemDataRole.UserRole)
-        if not isinstance(function, FunctionInfo):
+        return function if isinstance(function, FunctionInfo) else None
+
+    def _selected_decompilation_backend(self) -> str | None:
+        backend = self.function_decompilation_backend_selector.currentData()
+        return backend if isinstance(backend, str) and backend else None
+
+    def _reload_selected_function_decompilation(self) -> None:
+        function = self._selected_function()
+        if function is None or self._current_path is None or self._loading_image:
+            return
+        self._load_selected_function_decompilation(function)
+
+    def _on_function_decompilation_backend_changed(self, _index: int) -> None:
+        self._reload_selected_function_decompilation()
+
+    def _load_selected_function_decompilation(self, function: FunctionInfo) -> None:
+        backend = self._selected_decompilation_backend()
+        backend_label = backend if backend is not None else "best available backend"
+        self._current_function_decompilation = None
+        self.function_decompilation_summary.setText(
+            f"Loading HLL-style decompilation from radare2 using {backend_label}..."
+        )
+        self.function_decompilation_active_backend_value.setText(
+            "auto" if backend is None else backend
+        )
+        self.function_decompilation_available_backends_value.setText("Detecting...")
+        self.function_decompilation_warning_value.setText("-")
+        self.function_decompilation_declarations_value.setText("-")
+        self.function_decompilation_calls_summary.setText("Scanning HLL call summary...")
+        self._populate_function_decompilation_call_table(())
+        self.function_decompilation_context_summary.setText("Scanning HLL context...")
+        self._populate_function_decompilation_context_table(())
+        self.function_decompilation_preview.setHtml("")
+        self._thread_pool.start(
+            FunctionDecompilationWorker(
+                self._current_path,
+                function,
+                self._signals,
+                backend=backend,
+            )
+        )
+
+    def _on_function_selection_changed(self) -> None:
+        function = self._selected_function()
+        if function is None or self._current_path is None or self._loading_image:
             return
         self._selected_function_address = function.address
-        self._current_function_decompilation = None
         self._current_function_graph = None
         self.details_tabs.setCurrentIndex(1)
         self._update_function_details(function)
-        self.function_preview_tabs.setCurrentIndex(0)
+        if self._pending_function_scroll_address is None and self.function_preview_tabs.currentIndex() == 0:
+            self.function_preview_tabs.setCurrentIndex(1)
         self.function_disassembly_summary.setText("Loading function disassembly from radare2...")
         self.function_disassembly_preview.setPlainText("Loading function disassembly...")
-        self.function_decompilation_summary.setText("Loading HLL-style decompilation from radare2...")
-        self.function_decompilation_preview.setPlainText("Loading decompilation...")
         self.function_cfg_summary.setText("Loading control-flow graph from radare2...")
         self.function_cfg_scene.clear()
         self._cfg_block_items.clear()
@@ -2764,7 +3414,7 @@ class MainWindow(QMainWindow):
         self.function_source_value.setText(_source_lookup_message(self._current_image))
         self._set_status(f"Reading {function.name}...")
         self._thread_pool.start(FunctionDisassemblyWorker(self._current_path, function, self._signals))
-        self._thread_pool.start(FunctionDecompilationWorker(self._current_path, function, self._signals))
+        self._load_selected_function_decompilation(function)
         self._thread_pool.start(FunctionGraphWorker(self._current_path, function, self._signals))
         self._thread_pool.start(
             AddressMetadataWorker(
@@ -2973,6 +3623,95 @@ class MainWindow(QMainWindow):
             return
         self._navigate_to_address(address, prefer_section_scroll=False)
 
+    def _navigate_function_decompilation_target(self, url: QUrl) -> None:
+        address = self._parse_navigation_target(url)
+        if address is not None:
+            self.function_preview_tabs.setCurrentIndex(0)
+            self._navigate_to_address(address, prefer_section_scroll=False)
+            return
+        context_target = self._parse_hll_context_target(url)
+        if context_target is None:
+            return
+        kind, payload = context_target
+        if kind == "function":
+            address = _parse_hex_payload(payload)
+            if address is not None and self._select_function_by_address(address, scroll_address=address):
+                return
+            matched_function = self._find_function_by_name(payload)
+            if matched_function is not None and self._select_function_by_address(
+                matched_function.address,
+                scroll_address=matched_function.address,
+            ):
+                return
+        elif kind == "import":
+            if self._select_import_by_name(payload):
+                return
+        elif kind == "symbol":
+            address = _parse_hex_payload(payload)
+            if address is not None and self._select_symbol_by_address(address):
+                return
+            if self._select_symbol_by_name(payload):
+                return
+        elif kind == "string":
+            address = _parse_hex_payload(payload)
+            if address is not None and self._select_string_by_address(address):
+                return
+        self._set_status(f"No loaded HLL context matched {kind} {payload}", 4000)
+
+    def _navigate_selected_function_decompilation_context(self, *_args: object) -> None:
+        selected_items = self.function_decompilation_context_table.selectedItems()
+        if not selected_items:
+            return
+        context = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        if not isinstance(context, HllContextItem):
+            return
+        if context.kind == "Function":
+            if context.address > 0 and self._select_function_by_address(context.address, scroll_address=context.address):
+                return
+            matched_function = self._find_function_by_name(context.name)
+            if matched_function is not None and self._select_function_by_address(
+                matched_function.address,
+                scroll_address=matched_function.address,
+            ):
+                return
+        elif context.kind == "Import":
+            if self._select_import_by_name(context.name):
+                return
+        elif context.kind == "Symbol":
+            if context.address > 0 and self._select_symbol_by_address(context.address):
+                return
+            if self._select_symbol_by_name(context.name):
+                return
+        elif context.kind == "String":
+            if context.address > 0 and self._select_string_by_address(context.address):
+                return
+        self._set_status(f"No loaded navigation target matched {context.kind.lower()} {context.name}", 4000)
+
+    def _navigate_selected_function_decompilation_call(self, *_args: object) -> None:
+        selected_items = self.function_decompilation_calls_table.selectedItems()
+        if not selected_items:
+            return
+        call = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        if not isinstance(call, HllCallItem):
+            return
+        if call.kind == "Import" and self._select_import_by_name(call.name):
+            return
+        if call.kind == "Function":
+            if call.address > 0 and self._select_function_by_address(call.address, scroll_address=call.address):
+                return
+            matched_function = self._find_function_by_name(call.name)
+            if matched_function is not None and self._select_function_by_address(
+                matched_function.address,
+                scroll_address=matched_function.address,
+            ):
+                return
+        if call.kind == "Symbol":
+            if call.address > 0 and self._select_symbol_by_address(call.address):
+                return
+            if self._select_symbol_by_name(call.name):
+                return
+        self._set_status(f"No loaded call target matched {call.name}", 4000)
+
     def _parse_navigation_target(self, url: QUrl) -> int | None:
         target = url.toString()
         if not target.startswith("nav://"):
@@ -2981,6 +3720,16 @@ class MainWindow(QMainWindow):
             return int(target.removeprefix("nav://"), 16)
         except ValueError:
             return None
+
+    def _parse_hll_context_target(self, url: QUrl) -> tuple[str, str] | None:
+        target = url.toString()
+        if not target.startswith("ctx://"):
+            return None
+        body = target.removeprefix("ctx://")
+        kind, separator, payload = body.partition("/")
+        if not separator or not kind or not payload:
+            return None
+        return kind, unquote(payload)
 
     def _navigate_to_address(self, address: int, *, prefer_section_scroll: bool) -> None:
         if (
@@ -3112,6 +3861,18 @@ class MainWindow(QMainWindow):
             self.details_tabs.setCurrentIndex(3)
             self.imports_table.selectRow(row)
             self._set_status(f"Navigated to import {imp.name}", 4000)
+            return True
+        return False
+
+    def _select_string_by_address(self, address: int) -> bool:
+        for row in range(self.strings_table.rowCount()):
+            item = self.strings_table.item(row, 0)
+            string = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if not isinstance(string, StringInfo) or string.address != address:
+                continue
+            self.details_tabs.setCurrentIndex(2)
+            self.strings_table.selectRow(row)
+            self._set_status(f"Navigated to string at {_format_hex(address)}", 4000)
             return True
         return False
 
@@ -3285,6 +4046,87 @@ class MainWindow(QMainWindow):
         self.symbol_origin_label.setText("imported" if symbol.is_dynamic else "defined")
         self.symbol_source_label.setText(_source_lookup_message(self._current_image))
 
+    def _update_function_decompilation_status(self, result: FunctionDecompilationResult) -> None:
+        self.function_decompilation_active_backend_value.setText(
+            result.backend_display_name or result.backend
+        )
+        available = ", ".join(result.available_backends) if result.available_backends else "none"
+        self.function_decompilation_available_backends_value.setText(available)
+        warnings = "\n".join(result.warnings) if result.warnings else "none"
+        self.function_decompilation_warning_value.setText(warnings)
+
+    def _populate_function_decompilation_context_table(
+        self,
+        contexts: Sequence[HllContextItem],
+    ) -> None:
+        sorting_enabled = self.function_decompilation_context_table.isSortingEnabled()
+        self.function_decompilation_context_table.setSortingEnabled(False)
+        self.function_decompilation_context_table.setRowCount(len(contexts))
+        for row, context in enumerate(contexts):
+            values = (context.kind, context.name, context.detail)
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, context)
+                self.function_decompilation_context_table.setItem(row, column, item)
+        self.function_decompilation_context_table.setSortingEnabled(sorting_enabled)
+
+    def _populate_function_decompilation_call_table(
+        self,
+        calls: Sequence[HllCallItem],
+    ) -> None:
+        sorting_enabled = self.function_decompilation_calls_table.isSortingEnabled()
+        self.function_decompilation_calls_table.setSortingEnabled(False)
+        self.function_decompilation_calls_table.setRowCount(len(calls))
+        for row, call in enumerate(calls):
+            values = (call.kind, call.name, str(call.count), call.detail)
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, call)
+                self.function_decompilation_calls_table.setItem(row, column, item)
+        self.function_decompilation_calls_table.setSortingEnabled(sorting_enabled)
+
+    def _refresh_function_decompilation_insights(self) -> None:
+        if self._current_function_decompilation is None:
+            return
+        contexts = _correlate_function_decompilation_context(
+            self._current_function_decompilation,
+            functions=self._functions,
+            imports=self._imports,
+            strings=self._strings,
+            symbols=self._symbols,
+        )
+        calls = _extract_hll_calls(self._current_function_decompilation, contexts=contexts)
+        declarations = HllDeclarationSummary(
+            arguments=_parse_decompilation_arguments(self._current_function_decompilation),
+            locals=_parse_decompilation_locals(self._current_function_decompilation),
+        )
+        self._current_function_decompilation_contexts = contexts
+        self._current_function_decompilation_calls = calls
+        self._populate_function_decompilation_call_table(calls)
+        self._populate_function_decompilation_context_table(contexts)
+        self.function_decompilation_calls_summary.setText(f"{len(calls):,} summarized call targets.")
+        self.function_decompilation_context_summary.setText(f"{len(contexts):,} correlated context items.")
+        argument_text = ", ".join(declarations.arguments) if declarations.arguments else "none"
+        local_text = ", ".join(declarations.locals) if declarations.locals else "none"
+        self.function_decompilation_declarations_value.setText(
+            f"Args: {argument_text} | Locals: {local_text}"
+        )
+        self.function_decompilation_preview.setHtml(
+            format_function_decompilation_html(
+                self._current_function_decompilation,
+                inline_links=_build_hll_inline_links(contexts),
+                clean=self.function_decompilation_clean_toggle.isChecked(),
+            )
+        )
+
+    def _refresh_function_decompilation_contexts(self) -> None:
+        self._refresh_function_decompilation_insights()
+
+    def _clear_function_decompilation_status(self) -> None:
+        self.function_decompilation_active_backend_value.setText("auto")
+        self.function_decompilation_available_backends_value.setText("-")
+        self.function_decompilation_warning_value.setText("-")
+
     def _clear_section_details(self) -> None:
         self._current_section_disassembly = None
         self.detail_name.setText("No section selected")
@@ -3307,6 +4149,7 @@ class MainWindow(QMainWindow):
     def _clear_function_details(self) -> None:
         self._current_function_disassembly = None
         self._current_function_decompilation = None
+        self._current_function_decompilation_contexts = ()
         self._current_function_graph = None
         self._pending_function_scroll_address = None
         self._selected_cfg_block_address = None
@@ -3326,7 +4169,14 @@ class MainWindow(QMainWindow):
         self.function_decompilation_summary.setText(
             "Select a radare2 function to preview its HLL-style decompilation."
         )
-        self.function_decompilation_preview.setPlainText("")
+        self._clear_function_decompilation_status()
+        self._current_function_decompilation_calls = ()
+        self.function_decompilation_declarations_value.setText("-")
+        self.function_decompilation_calls_summary.setText("Calls update when HLL results load.")
+        self._populate_function_decompilation_call_table(())
+        self.function_decompilation_context_summary.setText("Context updates when HLL results load.")
+        self._populate_function_decompilation_context_table(())
+        self.function_decompilation_preview.setHtml("")
         self.function_cfg_summary.setText("Select a radare2 function to preview its control-flow graph.")
         self.function_cfg_scene.clear()
 

@@ -64,6 +64,7 @@ Responsibilities:
 - return full function disassembly with `pdfj`
 - detect available radare2 decompilation backends and decompile through `pdg`, `pdd`, or `pdc`
 - capture backend metadata, fallback state, warnings, and line/address correlations for HLL output when available
+- apply display-side `Clean HLL` heuristics for import thunks, static registration, fini teardown, stack-canary scaffolding, and declaration noise
 - return function CFGs with `agfj`
 - build a cross-format binary metadata report from `ij`, `iSj`, `iej`, `ilj`, and `iij`
 
@@ -163,6 +164,9 @@ The current window is organized as:
   - shell command input and command output
   - external `codex` launcher
   - external `gdb` launcher
+- View controls:
+  - collapsible browser pane
+  - collapsible console pane
 
 Section inspector:
 
@@ -178,6 +182,13 @@ Function inspector:
 - full function disassembly preview
 - HLL-style decompilation tab backed by the best available radare2 decompilation backend
 - backend/fallback status and correlation-aware metadata derived from decompiler output
+- HLL backend selector, reload control, and `Clean HLL` toggle
+- clickable HLL line links that navigate into disassembly when line/address mappings are available
+- correlated HLL context table for matched functions, imports, strings, and symbols
+- inline semantic HLL links for matched functions, imports, strings, and symbols when the text match is unambiguous
+- HLL call summary and extracted argument/local declaration summary
+- backend JSON-aware HLL extraction for calls and declarations, with text parsing fallback
+- display-side HLL cleanup that can collapse import thunks, static registration, fini teardown, stack-canary scaffolding, and leading temp declarations
 - CFG tab with clickable basic blocks
 - clickable target links that navigate within the current function or into another loaded function
 
@@ -266,8 +277,8 @@ Why this matters:
 1. After image load, radare2 function enumeration starts.
 2. `aflj` results populate the function table.
 3. User selects a function.
-4. `pdfj @ <addr>`, the best available decompilation command from `pdg`/`pdd`/`pdc`, and `agfj @ <addr>` run in the background.
-5. The function inspector updates with metadata, formatted disassembly, an HLL-style view, and a clickable control-flow graph.
+4. `pdfj @ <addr>`, the selected or best available decompilation command from `pdg`/`pdd`/`pdc`, and `agfj @ <addr>` run in the background.
+5. The function inspector updates with metadata, formatted disassembly, an HLL-style view with backend status, an optional `Clean HLL` presentation layer, optional clickable line/address mappings, inline semantic links, extracted declaration and call summaries, a correlated context table, and a clickable control-flow graph.
 
 ### String Flow
 
@@ -330,6 +341,7 @@ Current test coverage in [`src/test_main.py`](/home/gary/PycharmProjects/IronVie
 - radare2 section disassembly
 - radare2 function listing and function disassembly
 - radare2 function decompilation, backend fallback, and HLL metadata/correlation parsing
+- clean-mode HLL rendering heuristics for the current display-side simplification layer
 - radare2 function CFG loading
 - radare2 string listing and xrefs
 - radare2 import listing and callers

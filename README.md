@@ -32,6 +32,13 @@ The project supports both GUI and CLI workflows.
 - Preview full function disassembly for a selected function
 - Preview a function-level HLL-style view through radare2 decompilation backends with fallback across `pdg`, `pdd`, and `pdc`
 - Track HLL backend metadata, fallback state, warnings, and line/address correlations when radare2 exposes them
+- Select and reload HLL backends from the GUI, and click correlated HLL lines to jump into disassembly
+- Toggle `Clean HLL` mode to switch between raw backend output and IronView's cleaned presentation
+- Review correlated HLL context for functions, imports, strings, and symbols, then jump into those panes directly
+- Follow inline semantic HLL links for matched functions, imports, strings, and symbols when the rendered text is unambiguous
+- Review HLL call summaries and extracted argument/local declarations alongside the decompiled text
+- Prefer backend JSON for HLL calls and declarations when available, with text parsing as a fallback
+- Collapse common import-thunk, static-registration, fini-teardown, and stack-canary boilerplate in `Clean HLL` mode
 - Click jump and call targets directly from section and function disassembly
 - Inspect xrefs to selected strings and jump from xrefs into functions
 - Inspect callers of imported functions and jump from callers into functions
@@ -43,6 +50,7 @@ The project supports both GUI and CLI workflows.
 - Switch between light and dark themes
 - View a bottom system console with runtime events and analysis activity
 - Run Linux shell commands from the bottom console
+- Collapse and restore the browser and console panes from the `View` menu
 - Launch `codex` in an external terminal from the GUI
 - Launch `gdb` in an external terminal for the current binary
 
@@ -114,13 +122,19 @@ uv run python -m src.main /bin/ls --section .text
 10. Double-click an export or relocation row to jump toward the matching symbol, import, or function when available.
 11. Double-click an export or relocation xref row to jump to the referenced function when available.
 12. Select a function or symbol to load demangling and, for ELF binaries, source-location metadata.
-13. Use the `HLL` sub-tab inside the function inspector to review the best available radare2 decompilation backend output.
-14. Use the `CFG` sub-tab inside the function inspector to review basic blocks and click a block to jump into disassembly.
-15. Use the `Binary` tab to inspect the current binary through a radare2-backed metadata report and linked-library view.
-16. Use the bottom `System Console` to watch loads, exports, errors, and analysis activity.
-17. Enter Linux commands in the console input and run them in the project directory.
-18. Use `Run Codex` to launch `codex` in an external terminal with a real TTY.
-19. Use `Run GDB` to launch `gdb` for the current binary in an external terminal.
+13. Use the `HLL` sub-tab inside the function inspector to review the best available radare2 decompilation backend output, switch backends, reload the HLL view, and toggle `Clean HLL` on or off.
+14. Click correlated HLL line links to jump into function disassembly when address mappings are available.
+15. Use the HLL context table to jump into matched functions, imports, strings, and symbols referenced by the decompiled output.
+16. Click inline HLL semantic links to jump into matched functions, imports, strings, and symbols when available.
+17. Keep `Clean HLL` enabled for a shortened view that removes common radare2/plugin boilerplate such as import thunks, constructor registration, fini teardown, and stack-canary scaffolding.
+18. Use the HLL call summary and declarations view to review inferred callees, arguments, and locals.
+19. Use the `CFG` sub-tab inside the function inspector to review basic blocks and click a block to jump into disassembly.
+20. Use the `Binary` tab to inspect the current binary through a radare2-backed metadata report and linked-library view.
+21. Use the bottom `System Console` to watch loads, exports, errors, and analysis activity.
+22. Enter Linux commands in the console input and run them in the project directory.
+23. Use `View > Show Browser` and `View > Show Console` to reclaim space when focusing on HLL, disassembly, or CFG work.
+24. Use `Run Codex` to launch `codex` in an external terminal with a real TTY.
+25. Use `Run GDB` to launch `gdb` for the current binary in an external terminal.
 
 ## CLI Behavior
 
@@ -166,4 +180,5 @@ python3 -m py_compile src/gnu_toolchain.py src/disassembler.py src/gui.py src/ma
 - `ELF` is the most complete format today.
 - `PE/COFF` and `Mach-O` currently use the `libbfd` and radare2 paths, while GNU `addr2line` source lookup remains intentionally disabled for them.
 - Source mapping depends on debug info being present in or reachable from the binary.
-- The current radare2 integration covers sections, strings, imports, exports, relocations, symbols, functions, xrefs/callers, disassembly, HLL-style output through `pdg`/`pdd`/`pdc` fallback, and first-pass CFG views.
+- The current radare2 integration covers sections, strings, imports, exports, relocations, symbols, functions, xrefs/callers, disassembly, HLL-style output through `pdg`/`pdd`/`pdc` fallback, `Clean HLL` rendering heuristics, and first-pass CFG views.
+- `Clean HLL` is a presentation layer. It improves readability, but it does not replace a real source-level decompiler or guarantee semantically correct rewrites.

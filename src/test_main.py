@@ -4,7 +4,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtWidgets import QApplication, QTableWidgetItem
 
 import src.binary_loader
 import src.gnu_toolchain
@@ -14,6 +15,7 @@ from src.disassembler import (
     ControlFlowBlock,
     ControlFlowEdge,
     DecompilationAnnotation,
+    DecompilationInlineLink,
     DecompilationLineMapping,
     DisassembledInstruction,
     DisassemblyResult,
@@ -31,6 +33,7 @@ from src.disassembler import (
     XrefInfo,
     format_disassembly,
     format_disassembly_html,
+    format_function_decompilation_html,
     format_function_disassembly,
     format_function_disassembly_html,
 )
@@ -39,6 +42,10 @@ from src.gui import (
     AddressMetadataWorker,
     DARK_THEME,
     ErrorInfo,
+    FunctionDecompilationWorker,
+    HllCallItem,
+    HllContextItem,
+    HllDeclarationSummary,
     LIGHT_THEME,
     LoadedBinaryReport,
     LoadedExportXrefs,
@@ -46,9 +53,14 @@ from src.gui import (
     LoadedFunctionDecompilation,
     LoadedRelocationXrefs,
     MainWindow,
+    _build_hll_inline_links,
     _build_export_path,
+    _correlate_function_decompilation_context,
+    _extract_hll_calls,
     _find_cfg_block_address,
     _matches_section_filter,
+    _parse_decompilation_arguments,
+    _parse_decompilation_locals,
 )
 from src.main import main
 
@@ -311,7 +323,49 @@ def test_radare2_decompile_function_includes_metadata_and_line_mappings() -> Non
     )
     assert any("Preferred HLL backend pdg was unavailable" in warning for warning in result.warnings)
     assert any("pdc output is heuristic" in warning for warning in result.warnings)
+    assert any("Only the built-in pdc backend is installed" in warning for warning in result.warnings)
     assert fake_r2.commands == ["pdg?", "pdd?", "pdc?", "pdc @ 4198400"]
+
+
+def test_radare2_decompile_function_simplifies_import_thunk_pdc_output() -> None:
+    class FakeR2:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def cmd(self, command: str) -> str:
+            self.commands.append(command)
+            responses = {
+                "pdg?": "You need to install the plugin with r2pm -ci r2ghidra",
+                "pdd?": "You need to install the plugin with r2pm -ci r2dec",
+                "pdc?": "Usage: pdc pseudo decompile function",
+                "pdc @ 8336": (
+                    "// callconv: rax amd64 (rdi, rsi, rdx, rcx, r8, r9);\n"
+                    "ssize_t read (int fildes, void *buf, size_t nbyte) {\n"
+                    "    loc_0x00002090:\n"
+                    "        goto loc_qword [reloc.read]\n"
+                    "        return rax;\n"
+                    "}"
+                ),
+            }
+            return responses[command]
+
+        def cmdj(self, command: str) -> dict[str, object]:
+            assert command == "pdcj @ 8336"
+            return {}
+
+    function = FunctionInfo("read", 0x2090, 0x10, 2, "sym", "ssize_t read(int fildes, void *buf, size_t nbyte);")
+    disassembler = Radare2Disassembler("/bin/ls")
+    fake_r2 = FakeR2()
+    disassembler._r2 = fake_r2
+    disassembler._architecture = "x86"
+    disassembler._bits = 64
+
+    result = disassembler.decompile_function(function)
+
+    assert result.backend == "pdc"
+    assert "return import.read(fildes, buf, nbyte);" in result.text
+    assert "goto loc_qword" not in result.text
+    assert any("thunk/import wrapper" in warning for warning in result.warnings)
 
 
 def test_radare2_lists_available_decompilation_backends_in_priority_order() -> None:
@@ -404,6 +458,459 @@ def test_radare2_decompile_function_rejects_unavailable_explicit_backend() -> No
 
     with pytest.raises(Radare2DisassemblerError, match="decompilation backend pdd is not available"):
         disassembler.decompile_function(function, backend="pdd")
+
+
+def test_function_decompilation_html_renders_navigation_links() -> None:
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdc",
+        backend_display_name="radare2 pseudo (pdc)",
+        text="int main(void) {\n    return 0;\n}",
+        line_mappings=(
+            DecompilationLineMapping(line_number=2, start=17, end=31, addresses=(0x401004,)),
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "nav://0x401004" in rendered
+    assert "0002" in rendered
+
+
+def test_function_decompilation_html_hides_inline_multi_address_noise() -> None:
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text="value = 1;",
+        line_mappings=(
+            DecompilationLineMapping(line_number=1, start=0, end=10, addresses=(0x401000, 0x401004, 0x401008)),
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert 'title="0x401000, 0x401004, 0x401008"' in rendered
+    assert "[1:" not in rendered
+
+
+def test_function_decompilation_html_cleans_plugin_noise_for_display() -> None:
+    function = FunctionInfo("entry.init2", 0x13EAB0, 0x40, 6, "sym", "void entry.init2(void);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text=(
+            "// callconv: rax amd64 (rdi, rsi);\n"
+            "void entry.init2(void)\n"
+            "{\n"
+            "    if (*0x5ec170 == '\\0') {\n"
+            "        sym.imp.__cxa_atexit(0x15a990,0x5ec170,0x5ec000);\n"
+            "    }\n"
+            "    //WARNING: Could not recover jumptable\n"
+            "    return;\n"
+            "}\n"
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "//WARNING:" not in rendered
+    assert "callconv" not in rendered
+    assert "import.__cxa_atexit" in rendered
+    assert "g_5EC170" in rendered
+    assert "0x5ec000" in rendered
+
+
+def test_function_decompilation_html_can_render_raw_backend_output() -> None:
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text="// callconv: rax amd64\nsym.imp.printf('x');\nif (*0x5ec170 == '\\0') {\n}\n",
+    )
+
+    rendered = format_function_decompilation_html(result, clean=False)
+
+    assert "callconv" in rendered
+    assert "sym.imp.printf" in rendered
+    assert "0x5ec170" in rendered
+
+
+def test_function_decompilation_html_collapses_import_thunk_wrappers() -> None:
+    function = FunctionInfo(
+        "import.__snprintf_chk",
+        0xEC64E8,
+        0x20,
+        2,
+        "sym",
+        "void import.__snprintf_chk(char *s,size_t maxlen,int flag,size_t slen,char *format);",
+    )
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text=(
+            "void import.__snprintf_chk(char *s,size_t maxlen,int flag,size_t slen,char *format)\n"
+            "{\n"
+            "    (*g_EC64E8)();\n"
+            "    return;\n"
+            "}\n"
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "(*g_EC64E8)();" not in rendered
+    assert "/* import thunk */" in rendered
+    assert "return import.__snprintf_chk(s, maxlen, flag, slen, format);" in rendered
+
+
+def test_function_decompilation_html_collapses_import_thunk_using_header_name() -> None:
+    function = FunctionInfo(
+        "sym.imp.as_system_info_get_modaliases",
+        0x22050,
+        0x20,
+        2,
+        "sym",
+        "void import.as_system_info_get_modaliases(void);",
+    )
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text=(
+            "void import.as_system_info_get_modaliases(void)\n"
+            "{\n"
+            "    (*g_22050)();\n"
+            "    return;\n"
+            "}\n"
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "(*g_22050)();" not in rendered
+    assert "import.as_system_info_get_modaliases();" in rendered
+
+
+def test_function_decompilation_html_collapses_cpp_atexit_registration_sequence() -> None:
+    function = FunctionInfo("entry.init2", 0x13EAB0, 0x40, 6, "sym", "void entry.init2(void);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text=(
+            "void entry.init2(void)\n"
+            "{\n"
+            "    if (g_5EC170 == 0) {\n"
+            "        g_5EC170 = 1;\n"
+            "        g_5EC198 = import.operator_new_unsigned_long_(8);\n"
+            "        *g_5EC198 = 0x5aecb0;\n"
+            "        import.__cxa_atexit(0x15a990,g_5EC198,0x5ec000);\n"
+            "    }\n"
+            "}\n"
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "import.operator_new_unsigned_long_" not in rendered
+    assert "import.__cxa_atexit" not in rendered
+    assert "g_5EC198 = register_atexit_object(0x5aecb0, 0x15a990, 0x5ec000); /* simplified */" in rendered
+
+
+def test_function_decompilation_html_collapses_fini_teardown_sequence() -> None:
+    function = FunctionInfo("entry.fini0", 0x1400, 0x30, 6, "sym", "void entry.fini0(void);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text=(
+            "void entry.fini0(void)\n"
+            "{\n"
+            "    if (*0x40b0 == 0) {\n"
+            "        if (*0x3fd8 != 0) {\n"
+            "            import.__cxa_finalize(*0x40a8);\n"
+            "        }\n"
+            "        fcn.00001420();\n"
+            "        *0x40b0 = 1;\n"
+            "        return;\n"
+            "    }\n"
+            "    return;\n"
+            "}\n"
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "import.__cxa_finalize" not in rendered
+    assert "fcn.00001420();" not in rendered
+    assert "if (g_40B0 == 0) {" in rendered
+    assert "finalize_module(g_40A8, fcn.00001420, g_3FD8); /* simplified */" in rendered
+    assert "g_40B0 = 1;" in rendered
+
+
+def test_function_decompilation_html_cleans_stack_canary_and_code_labels() -> None:
+    function = FunctionInfo("main", 0x5800, 0x80, 10, "sym", "uint8_t main(int argc,char **argv);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text=(
+            "uint8_t main(int argc,char **argv)\n"
+            "{\n"
+            "    int64_t in_FS_OFFSET;\n"
+            "    int64_t iStack_20;\n"
+            "    iStack_20 = *(in_FS_OFFSET + 0x28);\n"
+            "    if (g_B768 == 1) {\n"
+            "        goto code_r0x000058ea;\n"
+            "    }\n"
+            "code_r0x000058ea:\n"
+            "    if (*(in_FS_OFFSET + 0x28) != iStack_20) {\n"
+            "        import.__stack_chk_fail();\n"
+            "    }\n"
+            "    return 0;\n"
+            "}\n"
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "in_FS_OFFSET" not in rendered
+    assert "iStack_20" not in rendered
+    assert "code_r0x000058ea" not in rendered
+    assert "check_stack_canary(); /* simplified */" in rendered
+    assert "return 0;" in rendered
+
+
+def test_function_decompilation_html_collapses_temp_declarations_and_return_style_canary() -> None:
+    function = FunctionInfo("main", 0x5800, 0x80, 10, "sym", "uchar main(int argc,char **argv);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text=(
+            "uchar main(int argc,char **argv)\n"
+            "{\n"
+            "    char *pcVar1;\n"
+            "    int iVar2;\n"
+            "    ulong uVar3;\n"
+            "    int64_t iStack_20;\n"
+            "    uchar uVar11;\n"
+            "    iStack_20 = *(in_FS_OFFSET + 0x28);\n"
+            "    uVar11 = 0;\n"
+            "    if (iStack_20 == *(in_FS_OFFSET + 0x28)) {\n"
+            "        return uVar11;\n"
+            "    }\n"
+            "    import.__stack_chk_fail();\n"
+            "}\n"
+        ),
+    )
+
+    rendered = format_function_decompilation_html(result)
+
+    assert "pcVar1" not in rendered
+    assert "iVar2" not in rendered
+    assert "uVar3" not in rendered
+    assert "1 temporaries omitted" in rendered
+    assert "check_stack_canary(); /* simplified */" in rendered
+    assert "return uVar11;" in rendered
+    assert "__stack_chk_fail" not in rendered
+
+
+def test_function_decompilation_html_renders_inline_context_links() -> None:
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdc",
+        text='sym.imp.printf("usage");',
+    )
+
+    rendered = format_function_decompilation_html(
+        result,
+        inline_links=(
+            DecompilationInlineLink("sym.imp.printf", "ctx://import/printf", "Import: printf"),
+            DecompilationInlineLink("usage", "ctx://string/0x404000", "String: usage"),
+        ),
+    )
+
+    assert "ctx://import/printf" in rendered
+    assert "ctx://string/0x404000" in rendered
+
+
+def test_correlate_function_decompilation_context_finds_loaded_entities() -> None:
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdc",
+        text=(
+            'int main(void) {\n'
+            '    sym.imp.printf("usage");\n'
+            '    helper();\n'
+            '    return exported_symbol;\n'
+            '}\n'
+        ),
+    )
+
+    contexts = _correlate_function_decompilation_context(
+        result,
+        functions=(function, FunctionInfo("helper", 0x402000, 0x10, 1, "sym", "helper();")),
+        imports=(ImportInfo("printf", "GLOBAL", "FUNC", 0x403000),),
+        strings=(StringInfo("usage", 0x404000, 5, 5, ".rodata", "ascii"),),
+        symbols=(SymbolInfo("exported_symbol", "exported_symbol", 0x405000, "OBJ", 8, False),),
+    )
+
+    assert [(context.kind, context.name, context.detail, context.address) for context in contexts] == [
+        ("Function", "helper", "0x402000", 0x402000),
+        ("Import", "printf", "0x403000", 0x403000),
+        ("String", "usage", "0x404000", 0x404000),
+        ("Symbol", "exported_symbol", "0x405000", 0x405000),
+    ]
+    assert "helper" in contexts[0].match_names
+    assert "import.printf" in contexts[1].match_names
+    assert "sym.imp.printf" in contexts[1].match_names
+
+
+def test_build_hll_inline_links_renders_context_targets() -> None:
+    links = _build_hll_inline_links(
+        (
+            HllContextItem("Import", "printf", "0x403000", 0x403000, ("printf", "sym.imp.printf")),
+            HllContextItem("Function", "helper", "0x402000", 0x402000, ("helper",)),
+        )
+    )
+
+    assert any(link.href == "ctx://import/printf" and link.match_text == "sym.imp.printf" for link in links)
+    assert any(link.href == "ctx://function/0x402000" and link.match_text == "helper" for link in links)
+
+
+def test_parse_decompilation_arguments_and_locals() -> None:
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(int argc, char **argv);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdc",
+        text=(
+            "int main(int argc, char **argv) {\n"
+            "    char *buffer;\n"
+            "    int status = 0;\n"
+            "    return status;\n"
+            "}\n"
+        ),
+    )
+
+    assert _parse_decompilation_arguments(result) == ("argc", "argv")
+    assert _parse_decompilation_locals(result) == ("buffer", "status")
+
+
+def test_parse_decompilation_arguments_and_locals_prefers_structured_json() -> None:
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text="int main(void) {\n    return 0;\n}\n",
+        raw_json={
+            "args": [{"name": "argc"}, {"name": "argv"}],
+            "locals": [{"name": "buffer"}, {"name": "status"}],
+        },
+    )
+
+    assert _parse_decompilation_arguments(result) == ("argc", "argv")
+    assert _parse_decompilation_locals(result) == ("buffer", "status")
+
+
+def test_extract_hll_calls_summarizes_known_targets() -> None:
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdc",
+        text=(
+            "sym.imp.printf(\"usage\");\n"
+            "helper();\n"
+            "helper();\n"
+            "exported_symbol();\n"
+        ),
+    )
+    contexts = (
+        HllContextItem("Function", "helper", "0x402000", 0x402000, ("helper",)),
+        HllContextItem("Import", "printf", "0x403000", 0x403000, ("printf", "sym.imp.printf")),
+        HllContextItem("Symbol", "exported_symbol", "0x405000", 0x405000, ("exported_symbol",)),
+    )
+
+    calls = _extract_hll_calls(result, contexts=contexts)
+
+    assert calls == (
+        HllCallItem("Import", "printf", 1, "0x403000", 0x403000),
+        HllCallItem("Function", "helper", 2, "0x402000", 0x402000),
+        HllCallItem("Symbol", "exported_symbol", 1, "0x405000", 0x405000),
+    )
+
+
+def test_extract_hll_calls_prefers_structured_json() -> None:
+    function = FunctionInfo("main", 0x401000, 0x20, 2, "sym", "int main(void);")
+    result = FunctionDecompilationResult(
+        path=Path("/tmp/sample.bin"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        text="printf();\nhelper();\n",
+        raw_json={
+            "calls": [
+                {"name": "sym.imp.printf", "count": 3},
+                {"name": "helper", "count": 2},
+            ]
+        },
+    )
+    contexts = (
+        HllContextItem("Function", "helper", "0x402000", 0x402000, ("helper",)),
+        HllContextItem("Import", "printf", "0x403000", 0x403000, ("printf", "sym.imp.printf")),
+    )
+
+    calls = _extract_hll_calls(result, contexts=contexts)
+
+    assert calls == (
+        HllCallItem("Import", "printf", 3, "0x403000", 0x403000),
+        HllCallItem("Function", "helper", 2, "0x402000", 0x402000),
+    )
 
 
 def test_disassembly_html_renders_navigation_links() -> None:
@@ -750,6 +1257,7 @@ def test_main_window_loads_function_decompilation(qt_app: QApplication) -> None:
         LoadedFunctionDecompilation(
             path=Path("/bin/ls"),
             function_address=function.address,
+            requested_backend=None,
             result=result,
         )
     )
@@ -759,6 +1267,282 @@ def test_main_window_loads_function_decompilation(qt_app: QApplication) -> None:
     assert "Fallback backend in use." in window.function_decompilation_summary.text()
     assert "1 correlated lines." in window.function_decompilation_summary.text()
     assert "return 0;" in window.function_decompilation_preview.toPlainText()
+    window.close()
+
+
+def test_main_window_load_selected_function_decompilation_uses_selected_backend(
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow()
+    function = FunctionInfo("main", 0x401000, 0x30, 3, "sym", "int main(void);")
+    window._current_path = Path("/bin/ls")
+    window.function_decompilation_backend_selector.setCurrentIndex(2)
+    started: list[FunctionDecompilationWorker] = []
+
+    def capture_start(worker: object) -> None:
+        if isinstance(worker, FunctionDecompilationWorker):
+            started.append(worker)
+
+    monkeypatch.setattr(window._thread_pool, "start", capture_start)
+
+    window._load_selected_function_decompilation(function)
+    qt_app.processEvents()
+
+    assert started
+    assert started[0].backend == "pdd"
+    assert "using pdd" in window.function_decompilation_summary.text()
+    window.close()
+
+
+def test_main_window_can_toggle_clean_hll_rendering(qt_app: QApplication) -> None:
+    window = MainWindow()
+    function = FunctionInfo("main", 0x401000, 0x30, 3, "sym", "int main(void);")
+    result = FunctionDecompilationResult(
+        path=Path("/bin/ls"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdg",
+        backend_display_name="r2ghidra (pdg)",
+        text="sym.imp.printf(\"x\");\nif (*0x5ec170 == '\\0') {\n    *0x5ec170 = '\\x01';\n}\n",
+    )
+    window._current_path = Path("/bin/ls")
+    window._selected_function_address = function.address
+
+    window._on_function_decompilation_loaded(
+        LoadedFunctionDecompilation(
+            path=Path("/bin/ls"),
+            function_address=function.address,
+            requested_backend=None,
+            result=result,
+        )
+    )
+    qt_app.processEvents()
+
+    cleaned = window.function_decompilation_preview.toPlainText()
+    assert "import.printf" in cleaned
+    assert "g_5EC170 == 0" in cleaned
+    assert "g_5EC170 = 1" in cleaned
+
+    window.function_decompilation_clean_toggle.setChecked(False)
+    qt_app.processEvents()
+
+    raw = window.function_decompilation_preview.toPlainText()
+    assert "sym.imp.printf" in raw
+    assert "*0x5ec170 == '\\0'" in raw
+    assert "*0x5ec170 = '\\x01'" in raw
+    window.close()
+
+
+def test_main_window_direct_function_selection_defaults_to_hll(
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow()
+    function = FunctionInfo("main", 0x401000, 0x30, 3, "sym", "int main(void);")
+    window._current_path = Path("/bin/ls")
+    window._populate_functions_table((function,))
+    monkeypatch.setattr(window._thread_pool, "start", lambda _worker: None)
+
+    window.functions_table.selectRow(0)
+    window._on_function_selection_changed()
+    qt_app.processEvents()
+
+    assert window.function_preview_tabs.currentIndex() == 1
+    assert window.function_decompilation_insights_tabs.count() == 3
+    window.close()
+
+
+def test_main_window_navigation_selection_keeps_disassembly_active(
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow()
+    function = FunctionInfo("main", 0x401000, 0x30, 3, "sym", "int main(void);")
+    window._current_path = Path("/bin/ls")
+    window._populate_functions_table((function,))
+    window._pending_function_scroll_address = 0x401004
+    monkeypatch.setattr(window._thread_pool, "start", lambda _worker: None)
+
+    window.functions_table.selectRow(0)
+    window._on_function_selection_changed()
+    qt_app.processEvents()
+
+    assert window.function_preview_tabs.currentIndex() == 0
+    window.close()
+
+
+def test_main_window_can_toggle_browser_pane(qt_app: QApplication) -> None:
+    window = MainWindow()
+    window.show()
+    qt_app.processEvents()
+
+    window.toggle_browser_action.trigger()
+    qt_app.processEvents()
+    collapsed_sizes = window.left_splitter.sizes()
+
+    assert not window.toggle_browser_action.isChecked()
+    assert collapsed_sizes[1] == 0
+
+    window.toggle_browser_action.trigger()
+    qt_app.processEvents()
+    restored_sizes = window.left_splitter.sizes()
+
+    assert window.toggle_browser_action.isChecked()
+    assert restored_sizes[1] > 0
+    window.close()
+
+
+def test_main_window_can_toggle_console_pane(qt_app: QApplication) -> None:
+    window = MainWindow()
+    window.show()
+    qt_app.processEvents()
+
+    window.toggle_console_action.trigger()
+    qt_app.processEvents()
+    collapsed_sizes = window.body_splitter.sizes()
+
+    assert not window.toggle_console_action.isChecked()
+    assert collapsed_sizes[1] == 0
+
+    window.toggle_console_action.trigger()
+    qt_app.processEvents()
+    restored_sizes = window.body_splitter.sizes()
+
+    assert window.toggle_console_action.isChecked()
+    assert restored_sizes[1] > 0
+    window.close()
+
+
+def test_main_window_navigate_function_decompilation_target_switches_to_disassembly(
+    qt_app: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow()
+    function = FunctionInfo("main", 0x401000, 0x30, 3, "sym", "int main(void);")
+    window._current_function_disassembly = FunctionDisassemblyResult(
+        path=Path("/bin/ls"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        instructions=(
+            DisassembledInstruction(
+                address=0x401004,
+                size=3,
+                bytes_hex="31 C0",
+                text="xor eax, eax",
+            ),
+        ),
+    )
+    window.function_preview_tabs.setCurrentIndex(1)
+    monkeypatch.setattr(window, "_parse_navigation_target", lambda _url: 0x401004)
+
+    window._navigate_function_decompilation_target(QUrl("nav://0x401004"))
+    qt_app.processEvents()
+
+    assert window.function_preview_tabs.currentIndex() == 0
+    window.close()
+
+
+def test_main_window_navigate_function_decompilation_target_import_context(
+    qt_app: QApplication,
+) -> None:
+    window = MainWindow()
+    window._populate_imports_table((ImportInfo("printf", "GLOBAL", "FUNC", 0x403000),))
+
+    window._navigate_function_decompilation_target(QUrl("ctx://import/printf"))
+    qt_app.processEvents()
+
+    assert window.details_tabs.currentIndex() == 3
+    assert window.imports_table.currentRow() == 0
+    window.close()
+
+
+def test_main_window_loads_function_decompilation_context(qt_app: QApplication) -> None:
+    window = MainWindow()
+    function = FunctionInfo("main", 0x401000, 0x30, 3, "sym", "int main(int argc, char **argv);")
+    helper = FunctionInfo("helper", 0x402000, 0x10, 1, "sym", "helper();")
+    window._functions = (function, helper)
+    window._imports = (ImportInfo("printf", "GLOBAL", "FUNC", 0x403000),)
+    window._strings = (StringInfo("usage", 0x404000, 5, 5, ".rodata", "ascii"),)
+    window._symbols = (SymbolInfo("exported_symbol", "exported_symbol", 0x405000, "OBJ", 8, False),)
+    result = FunctionDecompilationResult(
+        path=Path("/bin/ls"),
+        function=function,
+        architecture="x86",
+        bits=64,
+        backend="pdc",
+        backend_display_name="radare2 pseudo (pdc)",
+        text='int main(int argc, char **argv) {\n    int status = 0;\n    sym.imp.printf("usage");\n    helper();\n    return exported_symbol;\n}',
+    )
+    window._current_path = Path("/bin/ls")
+    window._selected_function_address = function.address
+
+    window._on_function_decompilation_loaded(
+        LoadedFunctionDecompilation(
+            path=Path("/bin/ls"),
+            function_address=function.address,
+            requested_backend=None,
+            result=result,
+        )
+    )
+    qt_app.processEvents()
+
+    assert window.function_decompilation_context_table.rowCount() == 4
+    assert window.function_decompilation_calls_table.rowCount() == 2
+    assert window.function_decompilation_calls_summary.text() == "2 summarized call targets."
+    assert window.function_decompilation_context_summary.text() == "4 correlated context items."
+    assert "Args: argc, argv" in window.function_decompilation_declarations_value.text()
+    assert "Locals: status" in window.function_decompilation_declarations_value.text()
+    html = window.function_decompilation_preview.toHtml()
+    assert "ctx://import/printf" in html
+    assert "ctx://string/0x404000" in html
+    kinds = {
+        window.function_decompilation_context_table.item(row, 0).text()
+        for row in range(window.function_decompilation_context_table.rowCount())
+    }
+    assert kinds == {"Function", "Import", "String", "Symbol"}
+    window.close()
+
+
+def test_main_window_navigate_function_decompilation_context_import(
+    qt_app: QApplication,
+) -> None:
+    window = MainWindow()
+    window._populate_imports_table((ImportInfo("printf", "GLOBAL", "FUNC", 0x403000),))
+    window.function_decompilation_context_table.setRowCount(1)
+    for column, value in enumerate(("Import", "printf", "0x403000")):
+        item = QTableWidgetItem(value)
+        item.setData(Qt.ItemDataRole.UserRole, HllContextItem("Import", "printf", "0x403000", 0x403000))
+        window.function_decompilation_context_table.setItem(0, column, item)
+    window.function_decompilation_context_table.selectRow(0)
+
+    window._navigate_selected_function_decompilation_context()
+    qt_app.processEvents()
+
+    assert window.details_tabs.currentIndex() == 3
+    assert window.imports_table.currentRow() == 0
+    window.close()
+
+
+def test_main_window_navigate_function_decompilation_call_import(
+    qt_app: QApplication,
+) -> None:
+    window = MainWindow()
+    window._populate_imports_table((ImportInfo("printf", "GLOBAL", "FUNC", 0x403000),))
+    window.function_decompilation_calls_table.setRowCount(1)
+    for column, value in enumerate(("Import", "printf", "1", "0x403000")):
+        item = QTableWidgetItem(value)
+        item.setData(Qt.ItemDataRole.UserRole, HllCallItem("Import", "printf", 1, "0x403000", 0x403000))
+        window.function_decompilation_calls_table.setItem(0, column, item)
+    window.function_decompilation_calls_table.selectRow(0)
+
+    window._navigate_selected_function_decompilation_call()
+    qt_app.processEvents()
+
+    assert window.details_tabs.currentIndex() == 3
+    assert window.imports_table.currentRow() == 0
     window.close()
 
 

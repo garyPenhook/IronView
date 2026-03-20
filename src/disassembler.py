@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 import shutil
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import r2pipe
 from src.gnu_toolchain import SymbolInfo
@@ -23,6 +24,49 @@ DECOMPILATION_BACKEND_NAMES = {
     "pdd": "r2dec (pdd)",
     "pdc": "radare2 pseudo (pdc)",
 }
+THUNK_TARGET_PATTERN = re.compile(r"(?:reloc|sym\.imp)\.([A-Za-z0-9_$.@?]+)")
+SIGNATURE_HEADER_PATTERN = re.compile(r"^\s*([^{]+)\{\s*$")
+IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
+GLOBAL_DEREFERENCE_PATTERN = re.compile(r"(?P<stars>\*+)\s*0x(?P<addr>[0-9a-fA-F]{4,16})")
+HEX_ADDRESS_PATTERN = re.compile(r"(?<![A-Za-z0-9_])0x(?P<addr>[0-9a-fA-F]{4,16})(?![A-Za-z0-9_])")
+IMPORT_THUNK_CALL_PATTERN = re.compile(r"^\(\*+\s*g_[0-9A-F]+\)\s*\([^)]*\);\s*$")
+NEW_OBJECT_PATTERN = re.compile(
+    r"^(?P<indent>\s*)(?P<dest>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*import\.operator_new(?:_unsigned_long_)?\((?P<size>[^)]*)\);\s*$"
+)
+INIT_OBJECT_PATTERN = re.compile(
+    r"^(?P<indent>\s*)\*(?P<dest>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<value>[^;]+);\s*$"
+)
+ATEXIT_PATTERN = re.compile(
+    r"^(?P<indent>\s*)import\.__cxa_atexit\(\s*(?P<callback>[^,]+)\s*,\s*(?P<dest>[A-Za-z_][A-Za-z0-9_]*)\s*,\s*(?P<dso>[^)]+)\);\s*$"
+)
+GUARD_IF_ZERO_PATTERN = re.compile(r"^(?P<indent>\s*)if\s+\((?P<guard>[A-Za-z_][A-Za-z0-9_]*)\s*==\s*0\)\s*\{\s*$")
+GUARD_IF_NONZERO_PATTERN = re.compile(r"^(?P<indent>\s*)if\s+\((?P<guard>[A-Za-z_][A-Za-z0-9_]*)\s*!=\s*0\)\s*\{\s*$")
+CXA_FINALIZE_PATTERN = re.compile(r"^(?P<indent>\s*)import\.__cxa_finalize\(\s*(?P<handle>[^)]+)\);\s*$")
+FUNCTION_CALL_PATTERN = re.compile(r"^(?P<indent>\s*)(?P<callee>[A-Za-z_][A-Za-z0-9_.:]*)\(\);\s*$")
+ASSIGN_ONE_PATTERN = re.compile(r"^(?P<indent>\s*)(?P<guard>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*1;\s*$")
+CODE_LABEL_PATTERN = re.compile(r"^\s*code_r0x[0-9a-fA-F]+:\s*$")
+GOTO_CODE_LABEL_PATTERN = re.compile(r"\bgoto\s+code_r0x[0-9a-fA-F]+;")
+STACK_CANARY_INIT_PATTERN = re.compile(
+    r"^(?P<indent>\s*)(?P<slot>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\*\(in_FS_OFFSET \+ 0x28\);\s*$"
+)
+STACK_CANARY_CHECK_PATTERN = re.compile(
+    r"^(?P<indent>\s*)if\s+\(\*\(in_FS_OFFSET \+ 0x28\)\s*!=\s*(?P<slot>[A-Za-z_][A-Za-z0-9_]*)\)\s*\{\s*$"
+)
+STACK_FAIL_PATTERN = re.compile(r"^\s*import\.__stack_chk_fail\(\);\s*$")
+DECLARATION_NAME_PATTERN = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_:<>]*[\s\*\[\]]+)+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*;\s*$"
+)
+STACK_CANARY_RETURN_PATTERN = re.compile(
+    r"^(?P<indent>\s*)if\s+\((?P<slot>[A-Za-z_][A-Za-z0-9_]*)\s*==\s*\*\(in_FS_OFFSET \+ 0x28\)\)\s*\{\s*$"
+)
+RETURN_VALUE_PATTERN = re.compile(r"^(?P<indent>\s*)return\b.*;\s*$")
+TEMP_LOCAL_NAME_PATTERN = re.compile(
+    r"^(?:"
+    r"(?:pc|ppc|pu|pi|pb|psz|ps|p|i|u|b|c|au|ai|f)d?Var\d+"
+    r"|(?:pc|u|i|ai|au|f|b)Stack_[0-9A-Fa-f]+"
+    r"|in_FS_OFFSET"
+    r")$"
+)
 
 
 class Radare2DisassemblerError(RuntimeError):
@@ -86,6 +130,7 @@ class FunctionDecompilationResult:
     available_backends: tuple[str, ...] = ()
     used_fallback: bool = False
     warnings: tuple[str, ...] = ()
+    raw_json: dict[str, Any] | None = None
     annotations: tuple["DecompilationAnnotation", ...] = ()
     line_mappings: tuple["DecompilationLineMapping", ...] = ()
 
@@ -104,6 +149,13 @@ class DecompilationLineMapping:
     start: int
     end: int
     addresses: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DecompilationInlineLink:
+    match_text: str
+    href: str
+    title: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +293,372 @@ def format_function_disassembly_html(result: FunctionDisassemblyResult) -> str:
     lines.append("<div></div>")
     lines.extend(_format_instruction_html(instruction) for instruction in result.instructions)
     return _wrap_html(lines)
+
+
+def format_function_decompilation_html(
+    result: FunctionDecompilationResult,
+    *,
+    inline_links: Sequence[DecompilationInlineLink] = (),
+    clean: bool = True,
+) -> str:
+    mapping_by_line = {mapping.line_number: mapping for mapping in result.line_mappings}
+    rendered_lines = _clean_decompilation_lines(result.text) if clean else tuple(result.text.splitlines())
+    if clean:
+        rendered_lines = _collapse_temp_declaration_lines(rendered_lines)
+        rendered_lines = _collapse_cpp_registration_lines(rendered_lines)
+        rendered_lines = _collapse_fini_teardown_lines(rendered_lines)
+        rendered_lines = _collapse_stack_canary_lines(rendered_lines)
+        rendered_lines = _summarize_leading_declaration_block(rendered_lines)
+        rendered_lines = _collapse_import_thunk_lines(result.function, rendered_lines)
+    lines = []
+    for line_number, line in enumerate(rendered_lines, start=1):
+        mapping = mapping_by_line.get(line_number)
+        line_label = f"{line_number:04d}"
+        if mapping is not None and mapping.addresses:
+            primary_address = mapping.addresses[0]
+            title_attr = ""
+            if len(mapping.addresses) > 1:
+                address_summary = ", ".join(_format_hex(address) for address in mapping.addresses)
+                title_attr = f' title="{escape(address_summary)}"'
+            prefix = f'<a href="{_navigation_href(primary_address)}"{title_attr}>{escape(line_label)}</a>'
+        else:
+            prefix = escape(line_label)
+        lines.append(f"<div>{prefix}  {_format_decompilation_text_html(line, inline_links)}</div>")
+    if not lines:
+        lines.append("<div></div>")
+    return _wrap_html(lines)
+
+
+def _global_alias_name(address: str) -> str:
+    return f"g_{address.upper()}"
+
+
+def _clean_decompilation_lines(text: str) -> tuple[str, ...]:
+    alias_addresses = {
+        match.group("addr").upper()
+        for match in GLOBAL_DEREFERENCE_PATTERN.finditer(text)
+    }
+    cleaned_lines: list[str] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if (
+            not stripped
+            or stripped.startswith("//WARNING:")
+            or stripped.startswith("// callconv:")
+            or re.fullmatch(r"loc_0x[0-9a-fA-F]+:", stripped) is not None
+            or CODE_LABEL_PATTERN.match(stripped) is not None
+        ):
+            if not stripped:
+                cleaned_lines.append("")
+            continue
+        line = re.sub(r"\bsym\.imp\.", "import.", raw_line)
+        line = re.sub(r"\bimp\.", "import.", line)
+        line = re.sub(r"\bimport\.operator_new(?:_unsigned_long_)?\b", "import.operator_new", line)
+        line = GOTO_CODE_LABEL_PATTERN.sub("goto exit;", line)
+        line = re.sub(r"==\s*'\\0'", "== 0", line)
+        line = re.sub(r"!=\s*'\\0'", "!= 0", line)
+        line = re.sub(r"=\s*'\\0'", "= 0", line)
+        line = re.sub(r"=\s*'\\x01'", "= 1", line)
+        line = GLOBAL_DEREFERENCE_PATTERN.sub(
+            lambda match: f"{'*' * max(len(match.group('stars')) - 1, 0)}{_global_alias_name(match.group('addr'))}",
+            line,
+        )
+        if alias_addresses:
+            line = HEX_ADDRESS_PATTERN.sub(
+                lambda match: _global_alias_name(match.group("addr"))
+                if match.group("addr").upper() in alias_addresses
+                else match.group(0),
+                line,
+            )
+        cleaned_lines.append(line)
+    return tuple(cleaned_lines)
+
+
+def _collapse_cpp_registration_lines(lines: Sequence[str]) -> tuple[str, ...]:
+    collapsed: list[str] = []
+    index = 0
+    while index < len(lines):
+        if index + 2 < len(lines):
+            new_match = NEW_OBJECT_PATTERN.match(lines[index])
+            init_match = INIT_OBJECT_PATTERN.match(lines[index + 1])
+            atexit_match = ATEXIT_PATTERN.match(lines[index + 2])
+            if (
+                new_match is not None
+                and init_match is not None
+                and atexit_match is not None
+                and new_match.group("dest") == init_match.group("dest") == atexit_match.group("dest")
+            ):
+                indent = new_match.group("indent")
+                dest = new_match.group("dest")
+                value = init_match.group("value").strip()
+                callback = atexit_match.group("callback").strip()
+                dso = atexit_match.group("dso").strip()
+                collapsed.append(
+                    f"{indent}{dest} = register_atexit_object({value}, {callback}, {dso}); /* simplified */"
+                )
+                index += 3
+                continue
+        collapsed.append(lines[index])
+        index += 1
+    return tuple(collapsed)
+
+
+def _collapse_fini_teardown_lines(lines: Sequence[str]) -> tuple[str, ...]:
+    collapsed: list[str] = []
+    index = 0
+    while index < len(lines):
+        if index + 8 < len(lines):
+            guard_zero = GUARD_IF_ZERO_PATTERN.match(lines[index])
+            guard_nonzero = GUARD_IF_NONZERO_PATTERN.match(lines[index + 1])
+            finalize = CXA_FINALIZE_PATTERN.match(lines[index + 2])
+            inner_close = lines[index + 3].strip() == "}"
+            fini_call = FUNCTION_CALL_PATTERN.match(lines[index + 4])
+            assign_one = ASSIGN_ONE_PATTERN.match(lines[index + 5])
+            early_return = lines[index + 6].strip() == "return;"
+            outer_close = lines[index + 7].strip() == "}"
+            final_return = lines[index + 8].strip() == "return;"
+            if (
+                guard_zero is not None
+                and guard_nonzero is not None
+                and finalize is not None
+                and inner_close
+                and fini_call is not None
+                and assign_one is not None
+                and early_return
+                and outer_close
+                and final_return
+                and guard_zero.group("guard") == assign_one.group("guard")
+            ):
+                indent = guard_zero.group("indent")
+                finalize_guard = guard_nonzero.group("guard")
+                handle = finalize.group("handle").strip()
+                callee = fini_call.group("callee").strip()
+                guard = guard_zero.group("guard")
+                collapsed.append(lines[index])
+                collapsed.append(
+                    f"{indent}    finalize_module({handle}, {callee}, {finalize_guard}); /* simplified */"
+                )
+                collapsed.append(lines[index + 5])
+                collapsed.append(lines[index + 7])
+                collapsed.append(lines[index + 8])
+                index += 9
+                continue
+        collapsed.append(lines[index])
+        index += 1
+    return tuple(collapsed)
+
+
+def _collapse_stack_canary_lines(lines: Sequence[str]) -> tuple[str, ...]:
+    canary_slots = {
+        match.group("slot")
+        for line in lines
+        if (match := STACK_CANARY_INIT_PATTERN.match(line)) is not None
+    }
+    collapsed: list[str] = []
+    index = 0
+    while index < len(lines):
+        init_match = STACK_CANARY_INIT_PATTERN.match(lines[index])
+        if init_match is not None:
+            index += 1
+            continue
+        if index + 2 < len(lines):
+            check_match = STACK_CANARY_CHECK_PATTERN.match(lines[index])
+            fail_match = STACK_FAIL_PATTERN.match(lines[index + 1])
+            if check_match is not None and fail_match is not None and lines[index + 2].strip() == "}":
+                collapsed.append(f"{check_match.group('indent')}check_stack_canary(); /* simplified */")
+                index += 3
+                continue
+        if index + 3 < len(lines):
+            stripped_line = lines[index].strip()
+            return_check = STACK_CANARY_RETURN_PATTERN.match(lines[index])
+            return_line = RETURN_VALUE_PATTERN.match(lines[index + 1])
+            fail_match = STACK_FAIL_PATTERN.match(lines[index + 3])
+            if (
+                (
+                    return_check is not None
+                    or (
+                        stripped_line.startswith("if (")
+                        and stripped_line.endswith("{")
+                        and "in_FS_OFFSET + 0x28" in stripped_line
+                        and "==" in stripped_line
+                    )
+                )
+                and return_line is not None
+                and lines[index + 2].strip() == "}"
+                and fail_match is not None
+            ):
+                indent = return_check.group("indent") if return_check is not None else lines[index][: len(lines[index]) - len(lines[index].lstrip())]
+                collapsed.append(f"{indent}check_stack_canary(); /* simplified */")
+                collapsed.append(lines[index + 1])
+                index += 4
+                continue
+        declaration_match = DECLARATION_NAME_PATTERN.match(lines[index])
+        if declaration_match is not None and declaration_match.group("name") in canary_slots.union({"in_FS_OFFSET"}):
+            index += 1
+            continue
+        collapsed.append(lines[index])
+        index += 1
+    return tuple(collapsed)
+
+
+def _collapse_temp_declaration_lines(lines: Sequence[str]) -> tuple[str, ...]:
+    collapsed: list[str] = []
+    omitted_temps = False
+    inside_function_body = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "{":
+            inside_function_body = True
+            omitted_temps = False
+            collapsed.append(line)
+            continue
+        if inside_function_body:
+            declaration_match = None
+            if not (
+                stripped.startswith("return ")
+                or stripped.startswith("if ")
+                or stripped.startswith("goto ")
+                or stripped.startswith("for ")
+                or stripped.startswith("while ")
+                or stripped.startswith("switch ")
+            ):
+                declaration_match = DECLARATION_NAME_PATTERN.match(line)
+            if declaration_match is not None and TEMP_LOCAL_NAME_PATTERN.match(declaration_match.group("name")) is not None:
+                if not omitted_temps:
+                    collapsed.append("    /* temporaries omitted */")
+                    omitted_temps = True
+                continue
+            if stripped:
+                omitted_temps = False
+        collapsed.append(line)
+    return tuple(collapsed)
+
+
+def _summarize_leading_declaration_block(lines: Sequence[str]) -> tuple[str, ...]:
+    if len(lines) < 3 or lines[1].strip() != "{":
+        return tuple(lines)
+    preserved: list[str] = [lines[0], lines[1]]
+    kept_locals: list[str] = []
+    omitted_count = 0
+    index = 2
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if stripped == "/* temporaries omitted */":
+            omitted_count += 1
+            index += 1
+            continue
+        declaration_match = DECLARATION_NAME_PATTERN.match(lines[index])
+        if declaration_match is None:
+            break
+        name = declaration_match.group("name")
+        if TEMP_LOCAL_NAME_PATTERN.match(name) is not None:
+            omitted_count += 1
+        else:
+            kept_locals.append(name)
+        index += 1
+    if kept_locals or omitted_count:
+        parts: list[str] = []
+        if kept_locals:
+            visible = ", ".join(kept_locals[:6])
+            if len(kept_locals) > 6:
+                visible = f"{visible}, ..."
+            parts.append(f"locals: {visible}")
+        if omitted_count:
+            parts.append(f"{omitted_count} temporaries omitted")
+        preserved.append(f"    /* {'; '.join(parts)} */")
+    preserved.extend(lines[index:])
+    return tuple(preserved)
+
+
+def _collapse_import_thunk_lines(
+    function: FunctionInfo,
+    lines: Sequence[str],
+) -> tuple[str, ...]:
+    compact_lines = [line for line in lines if line.strip()]
+    if len(compact_lines) < 4:
+        return tuple(lines)
+    header = compact_lines[0].strip()
+    stripped_name = function.name.strip()
+    header_name_match = re.search(r"\b(import\.[A-Za-z_][A-Za-z0-9_$.@?]*)\s*\(", header)
+    header_name = header_name_match.group(1).strip() if header_name_match is not None else ""
+    import_name = stripped_name if stripped_name.startswith("import.") else header_name
+    if not import_name.startswith("import."):
+        return tuple(lines)
+    if compact_lines[1].strip() != "{":
+        return tuple(lines)
+    body_lines = [line.strip() for line in compact_lines[2:-1] if line.strip()]
+    if compact_lines[-1].strip() != "}" or not body_lines:
+        return tuple(lines)
+    if len(body_lines) == 2 and body_lines[-1] == "return;" and IMPORT_THUNK_CALL_PATTERN.match(body_lines[0]):
+        parameter_names = _parameter_names_from_header(header)
+        arguments = ", ".join(parameter_names)
+        call = f"    return {import_name}({arguments});" if arguments else f"    return {import_name}();"
+        return (header, "{", "    /* import thunk */", call, "}")
+    if len(body_lines) == 1 and IMPORT_THUNK_CALL_PATTERN.match(body_lines[0]):
+        parameter_names = _parameter_names_from_header(header)
+        arguments = ", ".join(parameter_names)
+        return_type = header.split("(", 1)[0].strip().rsplit(" ", 1)[0]
+        if return_type == "void":
+            call = f"    {import_name}({arguments});" if arguments else f"    {import_name}();"
+        else:
+            call = f"    return {import_name}({arguments});" if arguments else f"    return {import_name}();"
+        return (header, "{", "    /* import thunk */", call, "}")
+    return tuple(lines)
+
+
+def _format_decompilation_text_html(
+    line: str,
+    inline_links: Sequence[DecompilationInlineLink],
+) -> str:
+    matches: list[tuple[int, int, DecompilationInlineLink]] = []
+    for link in inline_links:
+        for token in _decompilation_link_tokens(link.match_text):
+            if len(token) < 2:
+                continue
+            pattern = rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])"
+            for match in re.finditer(pattern, line):
+                matches.append((match.start(), match.end(), link))
+    matches.sort(key=lambda item: (item[0], -(item[1] - item[0]), item[2].match_text))
+
+    selected: list[tuple[int, int, DecompilationInlineLink]] = []
+    cursor = 0
+    for start, end, link in matches:
+        if start < cursor:
+            continue
+        selected.append((start, end, link))
+        cursor = end
+
+    if not selected:
+        return escape(line)
+
+    parts: list[str] = []
+    cursor = 0
+    for start, end, link in selected:
+        if start > cursor:
+            parts.append(escape(line[cursor:start]))
+        title_attr = f' title="{escape(link.title)}"' if link.title else ""
+        parts.append(f'<a href="{escape(link.href)}"{title_attr}>{escape(line[start:end])}</a>')
+        cursor = end
+    if cursor < len(line):
+        parts.append(escape(line[cursor:]))
+    return "".join(parts)
+
+
+def _decompilation_link_tokens(token: str) -> tuple[str, ...]:
+    stripped = token.strip()
+    if not stripped:
+        return ()
+    candidates = {
+        stripped,
+        stripped.removeprefix("sym.imp."),
+        stripped.removeprefix("imp."),
+        stripped.removeprefix("import."),
+    }
+    if stripped.startswith("sym.imp."):
+        candidates.add(f"import.{stripped.removeprefix('sym.imp.')}")
+    elif stripped.startswith("imp."):
+        candidates.add(f"import.{stripped.removeprefix('imp.')}")
+    return tuple(candidate for candidate in candidates if candidate)
 
 
 def _format_hex(value: int) -> str:
@@ -599,18 +1017,26 @@ def _build_line_mappings(
     return tuple(mappings)
 
 
-def _load_decompilation_annotations(
+def _load_decompilation_json(
     r2: r2pipe.open_sync.open,
     backend: str,
     address: int,
-) -> tuple[DecompilationAnnotation, ...]:
+) -> dict[str, Any] | None:
     try:
         raw = r2.cmdj(f"{backend}j @ {address}") or {}
     except Exception:
-        return ()
+        return None
     if not isinstance(raw, dict):
+        return None
+    return raw
+
+
+def _extract_decompilation_annotations(
+    raw_decompilation: dict[str, Any] | None,
+) -> tuple[DecompilationAnnotation, ...]:
+    if not isinstance(raw_decompilation, dict):
         return ()
-    raw_annotations = raw.get("annotations")
+    raw_annotations = raw_decompilation.get("annotations")
     if not isinstance(raw_annotations, list):
         return ()
     annotations = tuple(
@@ -634,9 +1060,99 @@ def _build_decompilation_warnings(
         warnings.append(f"Preferred HLL backend {preferred} was unavailable; using {backend} instead.")
     if backend == "pdc":
         warnings.append("pdc output is heuristic pseudo-decompilation and may be less structured than plugin-backed output.")
+        if available_backends == ("pdc",):
+            warnings.append("Only the built-in pdc backend is installed. Install r2ghidra or r2dec for stronger HLL output.")
     if not available_backends:
         warnings.append("No radare2 decompilation backends were detected.")
     return tuple(warnings)
+
+
+def _header_from_signature(function: FunctionInfo, text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        match = SIGNATURE_HEADER_PATTERN.match(stripped)
+        if match is not None:
+            return f"{match.group(1).strip()}{{"
+    signature = function.signature.strip()
+    if signature:
+        return f"{signature.removesuffix(';')} {{"
+    return f"{function.name}() {{"
+
+
+def _parameter_names_from_header(header: str) -> tuple[str, ...]:
+    open_paren = header.find("(")
+    close_paren = header.rfind(")")
+    if open_paren < 0 or close_paren <= open_paren:
+        return ()
+    params = header[open_paren + 1 : close_paren].strip()
+    if not params or params == "void":
+        return ()
+    names: list[str] = []
+    for raw_param in params.split(","):
+        param = raw_param.strip()
+        if not param or param == "...":
+            continue
+        cleaned = param.split("=")[0].strip()
+        cleaned = cleaned.replace("[", " ").replace("]", " ")
+        cleaned = cleaned.rstrip("* ").strip()
+        match = IDENTIFIER_PATTERN.search(cleaned)
+        if match is None:
+            continue
+        names.append(match.group(0))
+    return tuple(names)
+
+
+def _simplify_thunk_decompilation(
+    function: FunctionInfo,
+    text: str,
+) -> tuple[str, tuple[str, ...]]:
+    normalized_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not normalized_lines:
+        return text, ()
+    target_name = ""
+    for line in normalized_lines:
+        if line.startswith("//"):
+            continue
+        match = THUNK_TARGET_PATTERN.search(line)
+        if match is not None:
+            target_name = match.group(1)
+            break
+    if not target_name:
+        return text, ()
+    body_lines = [
+        line
+        for line in normalized_lines
+        if not line.startswith("//")
+        and not line.endswith("{")
+        and line != "}"
+        and not line.startswith("loc_")
+    ]
+    if not body_lines:
+        return text, ()
+    recognized_lines = 0
+    saw_target_jump = False
+    for line in body_lines:
+        if THUNK_TARGET_PATTERN.search(line):
+            recognized_lines += 1
+            saw_target_jump = True
+            continue
+        if line.startswith("return "):
+            recognized_lines += 1
+            continue
+    if not saw_target_jump or recognized_lines != len(body_lines):
+        return text, ()
+    header = _header_from_signature(function, text)
+    args = ", ".join(_parameter_names_from_header(header))
+    callee = f"import.{target_name}"
+    return_type = header.split("(", 1)[0].strip().rsplit(" ", 1)[0]
+    if return_type == "void":
+        body = f"    {callee}({args});" if args else f"    {callee}();"
+    else:
+        body = f"    return {callee}({args});" if args else f"    return {callee}();"
+    simplified = "\n".join((header, body, "}"))
+    return simplified, ("Function is a thunk/import wrapper; HLL was synthesized from the trampoline target.",)
 
 
 class Radare2Disassembler:
@@ -1052,7 +1568,11 @@ class Radare2Disassembler:
             text = _normalize_decompilation_text(output)
             if text:
                 used_fallback = backend is None and candidate != DECOMPILATION_BACKEND_ORDER[0]
-                annotations = _load_decompilation_annotations(r2, candidate, function.address)
+                raw_json = _load_decompilation_json(r2, candidate, function.address)
+                annotations = _extract_decompilation_annotations(raw_json)
+                synthetic_warnings: tuple[str, ...] = ()
+                if candidate == "pdc":
+                    text, synthetic_warnings = _simplify_thunk_decompilation(function, text)
                 return FunctionDecompilationResult(
                     path=self.path,
                     function=function,
@@ -1069,7 +1589,9 @@ class Radare2Disassembler:
                         requested_backend=backend,
                         available_backends=available_backends,
                         used_fallback=used_fallback,
-                    ),
+                    )
+                    + synthetic_warnings,
+                    raw_json=raw_json,
                     annotations=annotations,
                     line_mappings=_build_line_mappings(text, annotations),
                 )
