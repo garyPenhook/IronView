@@ -1553,6 +1553,9 @@ class MainWindow(QMainWindow):
         self._selected_section_bytes = b""
         self._cfg_block_items: dict[int, QGraphicsRectItem] = {}
         self._selected_cfg_block_address: int | None = None
+        self._function_disassembly_cache: dict[tuple[Path, int], FunctionDisassemblyResult] = {}
+        self._function_decompilation_cache: dict[tuple[Path, int, str | None], FunctionDecompilationResult] = {}
+        self._function_graph_cache: dict[tuple[Path, int], FunctionGraphResult] = {}
         self._loading_image = False
         self._theme = LIGHT_THEME
         self._browser_splitter_sizes: list[int] | None = None
@@ -2384,6 +2387,7 @@ class MainWindow(QMainWindow):
         self.function_preview_tabs.addTab(disassembly_tab, "Disassembly")
         self.function_preview_tabs.addTab(decompilation_tab, "HLL")
         self.function_preview_tabs.addTab(cfg_tab, "CFG")
+        self.function_preview_tabs.currentChanged.connect(self._on_function_preview_tab_changed)
 
         layout.addLayout(detail_form)
         layout.addWidget(self.function_preview_tabs, stretch=1)
@@ -2730,6 +2734,9 @@ class MainWindow(QMainWindow):
         self._current_function_disassembly = None
         self._current_function_decompilation = None
         self._current_function_graph = None
+        self._function_disassembly_cache.clear()
+        self._function_decompilation_cache.clear()
+        self._function_graph_cache.clear()
         self._pending_function_scroll_address = None
         self._selected_section = None
         self._selected_function_address = None
@@ -2855,6 +2862,7 @@ class MainWindow(QMainWindow):
             return
         function = loaded.result.function
         self._current_function_disassembly = loaded.result
+        self._function_disassembly_cache[(loaded.result.path, function.address)] = loaded.result
         self.function_disassembly_summary.setText(
             f"{loaded.result.architecture} {loaded.result.bits}-bit function at {_format_hex(function.address)}. Click jump targets to navigate."
         )
@@ -2885,14 +2893,9 @@ class MainWindow(QMainWindow):
             return
         function = loaded.result.function
         self._current_function_decompilation = loaded.result
-        contexts = _correlate_function_decompilation_context(
-            loaded.result,
-            functions=self._functions,
-            imports=self._imports,
-            strings=self._strings,
-            symbols=self._symbols,
-        )
-        self._current_function_decompilation_contexts = contexts
+        self._function_decompilation_cache[
+            (loaded.result.path, function.address, loaded.requested_backend)
+        ] = loaded.result
         summary_parts = [
             f"{loaded.result.backend_display_name or loaded.result.backend} HLL-style decompilation for {function.name} at {_format_hex(function.address)}."
         ]
@@ -2919,6 +2922,7 @@ class MainWindow(QMainWindow):
             self._set_status(loaded.message, 4000)
             return
         self._current_function_graph = loaded.result
+        self._function_graph_cache[(loaded.result.path, loaded.result.function.address)] = loaded.result
         self._render_function_graph(loaded.result)
         self.function_cfg_summary.setText(
             f"{len(loaded.result.blocks):,} blocks, {len(loaded.result.edges):,} edges. Click a block to jump into disassembly."
@@ -3510,14 +3514,108 @@ class MainWindow(QMainWindow):
         backend = self.function_decompilation_backend_selector.currentData()
         return backend if isinstance(backend, str) and backend else None
 
+    def _function_disassembly_cache_key(self, function: FunctionInfo) -> tuple[Path, int] | None:
+        if self._current_path is None:
+            return None
+        return (self._current_path, function.address)
+
+    def _function_decompilation_cache_key(self, function: FunctionInfo) -> tuple[Path, int, str | None] | None:
+        if self._current_path is None:
+            return None
+        return (self._current_path, function.address, self._selected_decompilation_backend())
+
+    def _function_graph_cache_key(self, function: FunctionInfo) -> tuple[Path, int] | None:
+        if self._current_path is None:
+            return None
+        return (self._current_path, function.address)
+
     def _reload_selected_function_decompilation(self) -> None:
         function = self._selected_function()
         if function is None or self._current_path is None or self._loading_image:
             return
+        cache_key = self._function_decompilation_cache_key(function)
+        if cache_key is not None:
+            self._function_decompilation_cache.pop(cache_key, None)
         self._load_selected_function_decompilation(function)
 
     def _on_function_decompilation_backend_changed(self, _index: int) -> None:
-        self._reload_selected_function_decompilation()
+        function = self._selected_function()
+        if function is None or self._current_path is None or self._loading_image:
+            return
+        self._current_function_decompilation = None
+        self.function_decompilation_summary.setText(
+            "Open the HLL tab to load decompilation for the selected backend."
+        )
+        self._clear_function_decompilation_status()
+        self._current_function_decompilation_contexts = ()
+        self._current_function_decompilation_calls = ()
+        self._populate_function_decompilation_call_table(())
+        self.function_decompilation_calls_summary.setText("Calls update when HLL results load.")
+        self._populate_function_decompilation_context_table(())
+        self.function_decompilation_context_summary.setText("Context updates when HLL results load.")
+        self.function_decompilation_preview.setHtml("")
+        if self.function_preview_tabs.currentIndex() == 1:
+            self._reload_selected_function_decompilation()
+
+    def _ensure_selected_function_disassembly(self, function: FunctionInfo) -> None:
+        cache_key = self._function_disassembly_cache_key(function)
+        if cache_key is not None and (cached := self._function_disassembly_cache.get(cache_key)) is not None:
+            self._on_function_disassembly_loaded(
+                LoadedFunctionDisassembly(
+                    path=cached.path,
+                    function_address=function.address,
+                    result=cached,
+                    message="",
+                )
+            )
+            return
+        self.function_disassembly_summary.setText("Loading function disassembly from radare2...")
+        self.function_disassembly_preview.setPlainText("Loading function disassembly...")
+        self._thread_pool.start(FunctionDisassemblyWorker(self._current_path, function, self._signals))
+
+    def _ensure_selected_function_decompilation(self, function: FunctionInfo) -> None:
+        cache_key = self._function_decompilation_cache_key(function)
+        if cache_key is not None and (cached := self._function_decompilation_cache.get(cache_key)) is not None:
+            self._on_function_decompilation_loaded(
+                LoadedFunctionDecompilation(
+                    path=cached.path,
+                    function_address=function.address,
+                    requested_backend=self._selected_decompilation_backend(),
+                    result=cached,
+                    message="",
+                )
+            )
+            return
+        self._load_selected_function_decompilation(function)
+
+    def _ensure_selected_function_graph(self, function: FunctionInfo) -> None:
+        cache_key = self._function_graph_cache_key(function)
+        if cache_key is not None and (cached := self._function_graph_cache.get(cache_key)) is not None:
+            self._on_function_graph_loaded(
+                LoadedFunctionGraph(
+                    path=cached.path,
+                    function_address=function.address,
+                    result=cached,
+                    message="",
+                )
+            )
+            return
+        self.function_cfg_summary.setText("Loading control-flow graph from radare2...")
+        self.function_cfg_scene.clear()
+        self._cfg_block_items.clear()
+        self._selected_cfg_block_address = None
+        self._thread_pool.start(FunctionGraphWorker(self._current_path, function, self._signals))
+
+    def _on_function_preview_tab_changed(self, index: int) -> None:
+        function = self._selected_function()
+        if function is None or self._current_path is None or self._loading_image:
+            return
+        if index == 0:
+            self._ensure_selected_function_disassembly(function)
+        elif index == 1:
+            self._ensure_selected_function_decompilation(function)
+        elif index == 2:
+            self._ensure_selected_function_graph(function)
 
     def _load_selected_function_decompilation(self, function: FunctionInfo) -> None:
         backend = self._selected_decompilation_backend()
@@ -3551,23 +3649,36 @@ class MainWindow(QMainWindow):
         if function is None or self._current_path is None or self._loading_image:
             return
         self._selected_function_address = function.address
+        self._current_function_disassembly = None
+        self._current_function_decompilation = None
         self._current_function_graph = None
         self.details_tabs.setCurrentIndex(1)
         self._update_function_details(function)
-        if self._pending_function_scroll_address is None and self.function_preview_tabs.currentIndex() == 0:
-            self.function_preview_tabs.setCurrentIndex(1)
-        self.function_disassembly_summary.setText("Loading function disassembly from radare2...")
-        self.function_disassembly_preview.setPlainText("Loading function disassembly...")
-        self.function_cfg_summary.setText("Loading control-flow graph from radare2...")
+        self.function_disassembly_summary.setText(
+            "Loading function disassembly from radare2..."
+            if self.function_preview_tabs.currentIndex() == 0
+            else "Open the Disassembly tab to load full radare2 disassembly for this function."
+        )
+        self.function_disassembly_preview.setPlainText(
+            "Loading function disassembly..." if self.function_preview_tabs.currentIndex() == 0 else ""
+        )
+        self.function_cfg_summary.setText("Open the CFG tab to load the control-flow graph for this function.")
         self.function_cfg_scene.clear()
         self._cfg_block_items.clear()
         self._selected_cfg_block_address = None
         self.function_demangled_value.setText("Loading demangled name...")
         self.function_source_value.setText(_source_lookup_message(self._current_image))
+        self.function_decompilation_summary.setText("Open the HLL tab to load decompilation for this function.")
+        self._clear_function_decompilation_status()
+        self._current_function_decompilation_contexts = ()
+        self._current_function_decompilation_calls = ()
+        self._populate_function_decompilation_call_table(())
+        self.function_decompilation_calls_summary.setText("Calls update when HLL results load.")
+        self._populate_function_decompilation_context_table(())
+        self.function_decompilation_context_summary.setText("Context updates when HLL results load.")
+        self.function_decompilation_preview.setHtml("")
         self._set_status(f"Reading {function.name}...")
-        self._thread_pool.start(FunctionDisassemblyWorker(self._current_path, function, self._signals))
-        self._load_selected_function_decompilation(function)
-        self._thread_pool.start(FunctionGraphWorker(self._current_path, function, self._signals))
+        self._ensure_selected_function_disassembly(function)
         self._thread_pool.start(
             AddressMetadataWorker(
                 self._current_path,
@@ -3578,6 +3689,8 @@ class MainWindow(QMainWindow):
                 include_source_lookup=_supports_gnu_elf_metadata(self._current_image),
             )
         )
+        if self.function_preview_tabs.currentIndex() != 0:
+            self._on_function_preview_tab_changed(self.function_preview_tabs.currentIndex())
 
     def _on_string_selection_changed(self) -> None:
         selected_items = self.strings_table.selectedItems()
@@ -4240,14 +4353,18 @@ class MainWindow(QMainWindow):
     def _refresh_function_decompilation_insights(self) -> None:
         if self._current_function_decompilation is None:
             return
-        contexts = _correlate_function_decompilation_context(
-            self._current_function_decompilation,
-            functions=self._functions,
-            imports=self._imports,
-            strings=self._strings,
-            symbols=self._symbols,
-        )
-        calls = _extract_hll_calls(self._current_function_decompilation, contexts=contexts)
+        if self._current_function_decompilation.detailed_metadata_loaded:
+            contexts = _correlate_function_decompilation_context(
+                self._current_function_decompilation,
+                functions=self._functions,
+                imports=self._imports,
+                strings=self._strings,
+                symbols=self._symbols,
+            )
+            calls = _extract_hll_calls(self._current_function_decompilation, contexts=contexts)
+        else:
+            contexts = ()
+            calls = ()
         declarations = HllDeclarationSummary(
             arguments=_parse_decompilation_arguments(self._current_function_decompilation),
             locals=_parse_decompilation_locals(self._current_function_decompilation),
@@ -4256,8 +4373,18 @@ class MainWindow(QMainWindow):
         self._current_function_decompilation_calls = calls
         self._populate_function_decompilation_call_table(calls)
         self._populate_function_decompilation_context_table(contexts)
-        self.function_decompilation_calls_summary.setText(f"{len(calls):,} summarized call targets.")
-        self.function_decompilation_context_summary.setText(f"{len(contexts):,} correlated context items.")
+        if self._current_function_decompilation.detailed_metadata_loaded:
+            self.function_decompilation_calls_summary.setText(f"{len(calls):,} summarized call targets.")
+            self.function_decompilation_context_summary.setText(f"{len(contexts):,} correlated context items.")
+            inline_links = _build_hll_inline_links(contexts)
+        else:
+            self.function_decompilation_calls_summary.setText(
+                "Detailed HLL call extraction was skipped for this large function."
+            )
+            self.function_decompilation_context_summary.setText(
+                "Detailed HLL context correlation was skipped for this large function."
+            )
+            inline_links = ()
         argument_text = ", ".join(declarations.arguments) if declarations.arguments else "none"
         local_text = ", ".join(declarations.locals) if declarations.locals else "none"
         self.function_decompilation_declarations_value.setText(
@@ -4266,7 +4393,7 @@ class MainWindow(QMainWindow):
         self.function_decompilation_preview.setHtml(
             format_function_decompilation_html(
                 self._current_function_decompilation,
-                inline_links=_build_hll_inline_links(contexts),
+                inline_links=inline_links,
                 clean=self.function_decompilation_clean_toggle.isChecked(),
             )
         )

@@ -13,6 +13,8 @@ from src.gnu_toolchain import SymbolInfo
 RADARE2_FLAGS = ["-N", "-2", "-e", "scr.color=0", "-e", "bin.relocs.apply=true"]
 DEFAULT_INSTRUCTION_LIMIT = 64
 DECOMPILATION_BACKEND_ORDER = ("pdg", "pdd", "pdc")
+DECOMPILATION_DETAIL_MAX_INSTRUCTIONS = 600
+DECOMPILATION_DETAIL_MAX_LINES = 800
 DECOMPILATION_UNAVAILABLE_MARKERS = (
     "you need to install the plugin",
     "unknown command",
@@ -172,6 +174,7 @@ class FunctionDecompilationResult:
     available_backends: tuple[str, ...] = ()
     used_fallback: bool = False
     warnings: tuple[str, ...] = ()
+    detailed_metadata_loaded: bool = True
     raw_json: dict[str, Any] | None = None
     annotations: tuple["DecompilationAnnotation", ...] = ()
     line_mappings: tuple["DecompilationLineMapping", ...] = ()
@@ -1699,11 +1702,24 @@ class Radare2Disassembler:
             text = _normalize_decompilation_text(output)
             if text:
                 used_fallback = backend is None and candidate != DECOMPILATION_BACKEND_ORDER[0]
-                raw_json = _load_decompilation_json(r2, candidate, function.address)
-                annotations = _extract_decompilation_annotations(raw_json)
                 synthetic_warnings: tuple[str, ...] = ()
                 if candidate == "pdc":
                     text, synthetic_warnings = _simplify_thunk_decompilation(function, text)
+                detailed_metadata_loaded = (
+                    function.instruction_count <= DECOMPILATION_DETAIL_MAX_INSTRUCTIONS
+                    and len(text.splitlines()) <= DECOMPILATION_DETAIL_MAX_LINES
+                )
+                raw_json: dict[str, Any] | None = None
+                annotations: tuple[DecompilationAnnotation, ...] = ()
+                line_mappings: tuple[DecompilationLineMapping, ...] = ()
+                if detailed_metadata_loaded:
+                    raw_json = _load_decompilation_json(r2, candidate, function.address)
+                    annotations = _extract_decompilation_annotations(raw_json)
+                    line_mappings = _build_line_mappings(text, annotations)
+                else:
+                    synthetic_warnings += (
+                        "Detailed HLL metadata was skipped for this large function to improve load time.",
+                    )
                 return FunctionDecompilationResult(
                     path=self.path,
                     function=function,
@@ -1722,9 +1738,10 @@ class Radare2Disassembler:
                         used_fallback=used_fallback,
                     )
                     + synthetic_warnings,
+                    detailed_metadata_loaded=detailed_metadata_loaded,
                     raw_json=raw_json,
                     annotations=annotations,
-                    line_mappings=_build_line_mappings(text, annotations),
+                    line_mappings=line_mappings,
                 )
             failures.append(f"{candidate}: no decompilation output")
 
