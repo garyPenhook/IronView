@@ -50,6 +50,8 @@ Primary public types:
 
 Read-only `radare2` integration through `r2pipe`.
 
+Documented baseline: `radare2 6.1.1` on Linux.
+
 Responsibilities:
 
 - open `radare2` with conservative flags

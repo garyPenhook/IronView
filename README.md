@@ -60,6 +60,7 @@ The project supports both GUI and CLI workflows.
 - `uv`
 - A working `libbfd` shared library on the host
 - `radare2` available in `PATH`
+- The current documented and locally verified baseline is `radare2 6.1.1`
 - optional radare2 decompiler plugins such as `r2ghidra` (`pdg`) or `r2dec` (`pdd`) for richer HLL output
 - GNU userland tools: `addr2line`, `c++filt`, `nm`, `readelf`, and optionally `gdb`
 - A Linux desktop session for the GUI
@@ -80,6 +81,8 @@ If the project environment does not exist yet, `uv sync` will create it and inst
 - `PySide6`
 - `pytest`
 - `r2pipe`
+
+The app is currently developed and documented against `radare2 6.1.1`.
 
 ## Run
 
