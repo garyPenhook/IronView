@@ -58,7 +58,6 @@ from src.binary_loader import BinaryImage, BinaryLoader, BinaryLoaderError, Sect
 from src.disassembler import (
     BinaryMetadataReport,
     ControlFlowBlock,
-    ControlFlowEdge,
     DEFAULT_INSTRUCTION_LIMIT,
     DecompilationInlineLink,
     DisassemblyResult,
