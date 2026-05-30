@@ -481,7 +481,6 @@ def _collapse_fini_teardown_lines(lines: Sequence[str]) -> tuple[str, ...]:
                 finalize_guard = guard_nonzero.group("guard")
                 handle = finalize.group("handle").strip()
                 callee = fini_call.group("callee").strip()
-                guard = guard_zero.group("guard")
                 collapsed.append(lines[index])
                 collapsed.append(
                     f"{indent}    finalize_module({handle}, {callee}, {finalize_guard}); /* simplified */"

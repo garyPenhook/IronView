@@ -50,7 +50,6 @@ from src.gui import (
     GhidraReportWorker,
     HllCallItem,
     HllContextItem,
-    HllDeclarationSummary,
     LIGHT_THEME,
     LoadedBinaryReport,
     LoadedExportXrefs,
